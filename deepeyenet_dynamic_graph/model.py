@@ -1,0 +1,210 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+@dataclass
+class DecodeOutput:
+    logits: torch.Tensor
+    concept_logits: torch.Tensor
+    rc_edges: torch.Tensor
+    token_concept_edges: torch.Tensor
+    region_features: torch.Tensor
+    concept_features: torch.Tensor
+
+
+class RegionEncoder(nn.Module):
+    """Compact patch encoder for retinal region nodes."""
+
+    def __init__(self, embed_dim: int, patch_grid: int = 4, dropout: float = 0.2) -> None:
+        super().__init__()
+        self.patch_grid = patch_grid
+        self.num_regions = patch_grid * patch_grid
+        self.cnn = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((patch_grid, patch_grid)),
+        )
+        self.proj = nn.Sequential(nn.Flatten(2), nn.Dropout(dropout))
+        self.linear = nn.Linear(64, embed_dim)
+        self.pos_embed = nn.Parameter(torch.randn(self.num_regions, embed_dim) * 0.02)
+        self.anatomy_embed = nn.Embedding(4, embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self.cnn(x)
+        feat = self.proj(feat).transpose(1, 2)
+        feat = self.linear(feat)
+        anatomy_ids = self._anatomy_ids(x.device)
+        return feat + self.pos_embed.unsqueeze(0) + self.anatomy_embed(anatomy_ids).unsqueeze(0)
+
+    def _anatomy_ids(self, device: torch.device) -> torch.Tensor:
+        ids = []
+        for y in range(self.patch_grid):
+            for x in range(self.patch_grid):
+                ids.append((y >= self.patch_grid / 2) * 2 + (x >= self.patch_grid / 2))
+        return torch.tensor(ids, device=device, dtype=torch.long)
+
+
+class DynamicGraphCaptioner(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        concept_names: list[str],
+        pad_id: int,
+        bos_id: int,
+        eos_id: int,
+        embed_dim: int = 256,
+        hidden_dim: int = 256,
+        patch_grid: int = 4,
+        dropout: float = 0.2,
+        graph_steps: int = 1,
+    ) -> None:
+        super().__init__()
+        self.concept_names = concept_names
+        self.num_concepts = len(concept_names)
+        self.pad_id = pad_id
+        self.bos_id = bos_id
+        self.eos_id = eos_id
+        self.graph_steps = graph_steps
+
+        self.region_encoder = RegionEncoder(embed_dim, patch_grid=patch_grid, dropout=dropout)
+        self.token_embed = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_id)
+        self.concept_embed = nn.Parameter(torch.randn(self.num_concepts, embed_dim) * 0.02)
+        self.region_proj = nn.Linear(embed_dim, embed_dim)
+        self.concept_proj = nn.Linear(embed_dim, embed_dim)
+        self.graph_msg = nn.Linear(embed_dim, embed_dim)
+        self.init_hidden = nn.Linear(embed_dim, hidden_dim)
+        self.decoder = nn.GRUCell(embed_dim + embed_dim + embed_dim, hidden_dim)
+        self.hidden_to_graph = nn.Linear(hidden_dim, embed_dim)
+        self.out = nn.Linear(hidden_dim, vocab_size)
+        self.concept_head = nn.Linear(embed_dim, 1)
+        self.dropout = nn.Dropout(dropout)
+
+    def compute_region_concept_edges(
+        self, region_features: torch.Tensor, concept_features: torch.Tensor, hidden: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        r = self.region_proj(region_features)
+        c = self.concept_proj(concept_features)
+        if hidden is not None:
+            c = c + self.hidden_to_graph(hidden).unsqueeze(1)
+        scores = torch.matmul(r, c.transpose(1, 2)) / (r.shape[-1] ** 0.5)
+        return F.softmax(scores, dim=-1)
+
+    def propagate_graph(self, region_features: torch.Tensor, concept_features: torch.Tensor, rc_edges: torch.Tensor) -> torch.Tensor:
+        concept_msg = torch.matmul(rc_edges.transpose(1, 2), region_features)
+        concept_msg = concept_msg / max(1, region_features.shape[1])
+        for _ in range(self.graph_steps):
+            concept_features = F.gelu(concept_features + self.graph_msg(concept_msg))
+        return concept_features
+
+    def forward(self, images: torch.Tensor, tokens: torch.Tensor) -> DecodeOutput:
+        batch, seq_len = tokens.shape
+        region_features = self.region_encoder(images)
+        concept_features = self.concept_embed.unsqueeze(0).expand(batch, -1, -1)
+        rc0 = self.compute_region_concept_edges(region_features, concept_features)
+        concept_features = self.propagate_graph(region_features, concept_features, rc0)
+        pooled = region_features.mean(dim=1)
+        hidden = torch.tanh(self.init_hidden(pooled))
+
+        logits = []
+        rc_edges = []
+        token_concept_edges = []
+        for t in range(seq_len - 1):
+            rc_t = self.compute_region_concept_edges(region_features, concept_features, hidden)
+            graph_context = torch.matmul(rc_t.mean(dim=1).unsqueeze(1), concept_features).squeeze(1)
+            token_emb = self.token_embed(tokens[:, t])
+            concept_scores = torch.matmul(concept_features, self.hidden_to_graph(hidden).unsqueeze(-1)).squeeze(-1)
+            cy_t = F.softmax(concept_scores, dim=-1)
+            concept_context = torch.matmul(cy_t.unsqueeze(1), concept_features).squeeze(1)
+            hidden = self.decoder(torch.cat([token_emb, graph_context, concept_context], dim=-1), hidden)
+            hidden = self.dropout(hidden)
+            logits.append(self.out(hidden))
+            rc_edges.append(rc_t)
+            token_concept_edges.append(cy_t)
+
+        logits_t = torch.stack(logits, dim=1)
+        rc_edges_t = torch.stack(rc_edges, dim=1)
+        token_concept_t = torch.stack(token_concept_edges, dim=1)
+        concept_logits = self.concept_head(concept_features).squeeze(-1)
+        return DecodeOutput(logits_t, concept_logits, rc_edges_t, token_concept_t, region_features, concept_features)
+
+    @torch.no_grad()
+    def generate(self, images: torch.Tensor, max_len: int = 96) -> DecodeOutput:
+        batch = images.shape[0]
+        tokens = torch.full((batch, max_len), self.pad_id, dtype=torch.long, device=images.device)
+        tokens[:, 0] = self.bos_id
+        generated = []
+
+        region_features = self.region_encoder(images)
+        concept_features = self.concept_embed.unsqueeze(0).expand(batch, -1, -1)
+        rc0 = self.compute_region_concept_edges(region_features, concept_features)
+        concept_features = self.propagate_graph(region_features, concept_features, rc0)
+        hidden = torch.tanh(self.init_hidden(region_features.mean(dim=1)))
+
+        logits = []
+        rc_edges = []
+        token_concept_edges = []
+        prev = tokens[:, 0]
+        for t in range(max_len - 1):
+            rc_t = self.compute_region_concept_edges(region_features, concept_features, hidden)
+            graph_context = torch.matmul(rc_t.mean(dim=1).unsqueeze(1), concept_features).squeeze(1)
+            concept_scores = torch.matmul(concept_features, self.hidden_to_graph(hidden).unsqueeze(-1)).squeeze(-1)
+            cy_t = F.softmax(concept_scores, dim=-1)
+            concept_context = torch.matmul(cy_t.unsqueeze(1), concept_features).squeeze(1)
+            hidden = self.decoder(torch.cat([self.token_embed(prev), graph_context, concept_context], dim=-1), hidden)
+            step_logits = self.out(hidden)
+            prev = step_logits.argmax(dim=-1)
+            generated.append(prev)
+            logits.append(step_logits)
+            rc_edges.append(rc_t)
+            token_concept_edges.append(cy_t)
+        gen_tokens = torch.stack(generated, dim=1)
+        concept_logits = self.concept_head(concept_features).squeeze(-1)
+        return DecodeOutput(
+            torch.stack(logits, dim=1),
+            concept_logits,
+            torch.stack(rc_edges, dim=1),
+            torch.stack(token_concept_edges, dim=1),
+            region_features,
+            concept_features,
+        ), gen_tokens
+
+
+def compute_losses(
+    output: DecodeOutput,
+    target_tokens: torch.Tensor,
+    concept_targets: torch.Tensor,
+    pad_id: int,
+    lambda_concept: float = 0.4,
+    lambda_align: float = 0.1,
+    lambda_sparse: float = 0.01,
+    lambda_temp: float = 0.05,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    lm_targets = target_tokens[:, 1 : output.logits.shape[1] + 1]
+    rep_loss = F.cross_entropy(output.logits.reshape(-1, output.logits.shape[-1]), lm_targets.reshape(-1), ignore_index=pad_id)
+    concept_loss = F.binary_cross_entropy_with_logits(output.concept_logits, concept_targets)
+    concept_probs = torch.sigmoid(output.concept_logits)
+    align_loss = F.binary_cross_entropy(concept_probs.clamp(1e-4, 1 - 1e-4), concept_targets)
+    edge_probs = output.token_concept_edges.clamp_min(1e-8)
+    sparse_loss = -(edge_probs * edge_probs.log()).sum(dim=-1).mean()
+    temp_loss = torch.tensor(0.0, device=target_tokens.device)
+    if output.rc_edges.shape[1] > 1:
+        temp_loss = (output.rc_edges[:, 1:] - output.rc_edges[:, :-1]).abs().mean()
+    total = rep_loss + lambda_concept * concept_loss + lambda_align * align_loss + lambda_sparse * sparse_loss + lambda_temp * temp_loss
+    return total, {
+        "loss": float(total.detach().cpu()),
+        "rep_loss": float(rep_loss.detach().cpu()),
+        "concept_loss": float(concept_loss.detach().cpu()),
+        "align_loss": float(align_loss.detach().cpu()),
+        "sparse_loss": float(sparse_loss.detach().cpu()),
+        "temp_loss": float(temp_loss.detach().cpu()),
+    }
