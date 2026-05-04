@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import warnings
 from pathlib import Path
 from typing import Any, Callable
 
@@ -32,7 +34,82 @@ def _parse_keywords(value: Any) -> list[str]:
             return [str(v) for v in loaded]
     except Exception:
         pass
-    return [part.strip() for part in text.split(";") if part.strip()]
+    return [part.strip() for part in re.split(r"[;,]", text) if part.strip()]
+
+
+def _load_json_flexible(path: Path) -> Any:
+    """Load strict JSON, JSONL, or concatenated JSON objects.
+
+    Some Drive exports look like one JSON dictionary, while others contain one
+    object per line or multiple JSON dictionaries written back-to-back. Python's
+    plain json.loads raises "Extra data" for those concatenated exports.
+    """
+    text = path.read_text(encoding="utf-8-sig").strip()
+    decoder = json.JSONDecoder()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    line_objects = []
+    line_parse_failed = False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            line_objects.append(json.loads(line))
+        except json.JSONDecodeError:
+            line_parse_failed = True
+            break
+    if line_objects and not line_parse_failed:
+        return line_objects
+
+    objects = []
+    idx = 0
+    while idx < len(text):
+        while idx < len(text) and text[idx].isspace():
+            idx += 1
+        if idx >= len(text):
+            break
+        obj, end = decoder.raw_decode(text, idx)
+        objects.append(obj)
+        idx = end
+    if len(objects) == 1:
+        return objects[0]
+    return objects
+
+
+def _append_record(records: list[dict[str, Any]], image_path: str, meta: dict[str, Any]) -> None:
+    records.append(
+        {
+            "image_path": image_path,
+            "keywords": _parse_keywords(meta.get("Keywords", meta.get("keywords", []))),
+            "clinical_description": str(meta.get("clinical-description", meta.get("clinical_description", ""))),
+            "report_text": str(meta.get("report_text", meta.get("clinical-description", meta.get("clinical_description", "")))),
+        }
+    )
+
+
+def _records_from_json_raw(raw: Any) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if isinstance(raw, dict):
+        for image_path, meta in raw.items():
+            if isinstance(meta, dict):
+                _append_record(records, str(image_path), meta)
+        return records
+
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and "image_path" in item:
+                _append_record(records, str(item["image_path"]), item)
+            elif isinstance(item, dict):
+                for image_path, meta in item.items():
+                    if isinstance(meta, dict):
+                        _append_record(records, str(image_path), meta)
+        return records
+
+    raise ValueError(f"Unsupported JSON metadata structure: {type(raw)!r}")
 
 
 def load_split_records(data_root: str | Path, split: str) -> list[dict[str, Any]]:
@@ -43,17 +120,15 @@ def load_split_records(data_root: str | Path, split: str) -> list[dict[str, Any]
 
     records: list[dict[str, Any]] = []
     if json_path.exists():
-        raw = json.loads(json_path.read_text())
-        for image_path, meta in raw.items():
-            records.append(
-                {
-                    "image_path": image_path,
-                    "keywords": _parse_keywords(meta.get("Keywords", [])),
-                    "clinical_description": str(meta.get("clinical-description", "")),
-                    "report_text": str(meta.get("report_text", meta.get("clinical-description", ""))),
-                }
-            )
-        return records
+        try:
+            raw = _load_json_flexible(json_path)
+            records = _records_from_json_raw(raw)
+            if records:
+                return records
+        except Exception as exc:
+            if not csv_path.exists():
+                raise
+            warnings.warn(f"Could not parse {json_path.name} ({exc}); falling back to {csv_path.name}.")
 
     if csv_path.exists():
         df = pd.read_csv(csv_path)
