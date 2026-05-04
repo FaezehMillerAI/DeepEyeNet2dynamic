@@ -59,6 +59,7 @@ def evaluate_model(model, loader, vocab: Vocabulary, concepts: list[str], cfg: C
     references, hypotheses = [], []
     all_true, all_prob = [], []
     all_rc, all_tc = [], []
+    temporal_drifts = []
     faithfulness_drops = []
     examples = []
 
@@ -74,8 +75,11 @@ def evaluate_model(model, loader, vocab: Vocabulary, concepts: list[str], cfg: C
         probs = torch.sigmoid(teacher_output.concept_logits)
         all_true.append(batch["concept_targets"].numpy())
         all_prob.append(probs.cpu().numpy())
-        all_rc.append(teacher_output.rc_edges.cpu().numpy())
-        all_tc.append(teacher_output.token_concept_edges.cpu().numpy())
+        all_rc.append(teacher_output.rc_edges.mean(dim=1).cpu().numpy())
+        all_tc.append(teacher_output.token_concept_edges.mean(dim=1).cpu().numpy())
+        if teacher_output.rc_edges.shape[1] > 1:
+            drift = (teacher_output.rc_edges[:, 1:] - teacher_output.rc_edges[:, :-1]).abs().mean(dim=(1, 2, 3))
+            temporal_drifts.extend(drift.cpu().tolist())
 
         concept_ids = probs.argmax(dim=1)
         masked = _mask_top_regions(images, teacher_output.rc_edges, concept_ids, cfg.patch_grid)
@@ -106,7 +110,7 @@ def evaluate_model(model, loader, vocab: Vocabulary, concepts: list[str], cfg: C
     metrics = {}
     metrics.update(language_metrics(references, hypotheses))
     metrics.update(concept_metrics(y_true, y_prob))
-    metrics.update(graph_metrics(rc, tc, y_true, topk=cfg.topk_evidence))
+    metrics.update(graph_metrics(rc, tc, y_true, topk=cfg.topk_evidence, temporal_drifts=np.asarray(temporal_drifts)))
     metrics["faithfulness_confidence_drop_mean"] = float(np.mean(faithfulness_drops)) if faithfulness_drops else 0.0
     metrics["faithfulness_confidence_drop_median"] = float(np.median(faithfulness_drops)) if faithfulness_drops else 0.0
 

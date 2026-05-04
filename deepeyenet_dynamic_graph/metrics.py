@@ -57,16 +57,24 @@ def concept_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float = 0
     }
 
 
-def graph_metrics(rc_edges: np.ndarray, token_concept_edges: np.ndarray, y_true: np.ndarray, topk: int = 3) -> dict[str, float]:
+def graph_metrics(
+    rc_edges: np.ndarray,
+    token_concept_edges: np.ndarray,
+    y_true: np.ndarray,
+    topk: int = 3,
+    temporal_drifts: np.ndarray | None = None,
+) -> dict[str, float]:
     eps = 1e-8
     edge_entropy = float(-(token_concept_edges * np.log(token_concept_edges + eps)).sum(axis=-1).mean())
     rc_entropy = float(-(rc_edges * np.log(rc_edges + eps)).sum(axis=-1).mean())
     temp_drift = 0.0
-    if rc_edges.shape[1] > 1:
+    if temporal_drifts is not None and len(temporal_drifts):
+        temp_drift = float(np.mean(temporal_drifts))
+    elif rc_edges.ndim == 4 and rc_edges.shape[1] > 1:
         temp_drift = float(np.abs(rc_edges[:, 1:] - rc_edges[:, :-1]).mean())
 
     top_hits = []
-    mean_token_concept = token_concept_edges.mean(axis=1)
+    mean_token_concept = token_concept_edges.mean(axis=1) if token_concept_edges.ndim == 3 else token_concept_edges
     for probs, truth in zip(mean_token_concept, y_true):
         true_ids = set(np.where(truth > 0)[0].tolist())
         if not true_ids:
