@@ -12,7 +12,7 @@ The original markdown describes a dynamic explanation graph for chest X-ray repo
 - GRU report decoder conditioned on visual and graph evidence.
 - Multi-task losses for report generation, concept prediction, graph alignment, sparsity, and temporal consistency.
 - Evaluation suite for text quality, clinical concept fidelity, graph behavior, evidence faithfulness, and counterfactual sensitivity.
-- Publication-oriented visualizations: metric bars, confusion heatmaps, graph diagrams, evidence heatmaps, and counterfactual curves.
+- Publication-oriented visualizations: metric bars, confusion heatmaps, graph diagrams, evidence heatmaps, counterfactual curves, and an interactive hover explanation viewer.
 - A Colab notebook scaffold in `notebooks/DeepEyeNet_Dynamic_Graph_Colab.ipynb`.
 
 ## Expected Dataset Layout
@@ -92,6 +92,41 @@ python -m deepeyenet_dynamic_graph.evaluate \
   --output-dir outputs/iuxray_run1/eval \
   --split test \
   --num-workers 0
+```
+
+The evaluation folder includes `interactive_explanations.html`. Open it in a browser to hover over image regions and inspect anatomy, top findings, linked report text, and counterfactual drops.
+
+## Ablation Examples
+
+No anatomy layer:
+
+```bash
+python -m deepeyenet_dynamic_graph.train \
+  --dataset iuxray \
+  --data-root /path/to/IU-XRay \
+  --output-dir outputs/iuxray_no_anatomy \
+  --no-anatomy
+```
+
+No sparsity or temporal graph regularization:
+
+```bash
+python -m deepeyenet_dynamic_graph.train \
+  --dataset iuxray \
+  --data-root /path/to/IU-XRay \
+  --output-dir outputs/iuxray_no_graph_reg \
+  --lambda-sparse 0 \
+  --lambda-temp 0
+```
+
+Different patch granularity:
+
+```bash
+python -m deepeyenet_dynamic_graph.train \
+  --dataset deepeyenet \
+  --data-root /path/to/DeepEyeNet \
+  --output-dir outputs/deepeyenet_grid5 \
+  --patch-grid 5
 ```
 
 For Colab, open `notebooks/DeepEyeNet_Dynamic_Graph_Colab.ipynb`, mount Drive, set `DATA_ROOT`, and run the cells.

@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .config import Config
-from .data import MedicalReportDataset, build_artifacts, collate_fn
+from .data import MedicalReportDataset, anatomy_prior_matrix, build_artifacts, collate_fn, get_anatomy_names
 from .model import DynamicGraphCaptioner, compute_losses
 from .utils import ensure_dir, get_device, save_json, set_seed
 
@@ -23,9 +23,17 @@ def parse_args() -> Config:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--patch-grid", type=int, default=4)
     parser.add_argument("--max-report-len", type=int, default=96)
     parser.add_argument("--max-concepts", type=int, default=128)
+    parser.add_argument("--graph-steps", type=int, default=1)
+    parser.add_argument("--lambda-concept", type=float, default=0.4)
+    parser.add_argument("--lambda-align", type=float, default=0.1)
+    parser.add_argument("--lambda-sparse", type=float, default=0.01)
+    parser.add_argument("--lambda-temp", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--no-anatomy", action="store_true")
+    parser.add_argument("--disable-counterfactuals", action="store_true")
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
     cfg = Config(
@@ -36,9 +44,17 @@ def parse_args() -> Config:
         batch_size=args.batch_size,
         lr=args.lr,
         image_size=args.image_size,
+        patch_grid=args.patch_grid,
         max_report_len=args.max_report_len,
         max_concepts=args.max_concepts,
+        graph_steps=args.graph_steps,
+        lambda_concept=args.lambda_concept,
+        lambda_align=args.lambda_align,
+        lambda_sparse=args.lambda_sparse,
+        lambda_temp=args.lambda_temp,
         num_workers=args.num_workers,
+        use_anatomy=not args.no_anatomy,
+        disable_counterfactuals=args.disable_counterfactuals,
         device=args.device,
     )
     return cfg
@@ -105,6 +121,9 @@ def main() -> None:
         cfg.patch_grid,
         cfg.dropout,
         cfg.graph_steps,
+        get_anatomy_names(cfg.dataset),
+        anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
+        cfg.use_anatomy,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     best = float("inf")

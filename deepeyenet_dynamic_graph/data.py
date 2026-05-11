@@ -51,6 +51,60 @@ IU_XRAY_TERMS = [
 ]
 
 
+ANATOMY_NODES = {
+    "deepeyenet": ["superior retina", "inferior retina", "nasal retina", "temporal retina", "macula", "optic disc", "retinal vessels"],
+    "iuxray": ["left upper lung", "left lower lung", "right upper lung", "right lower lung", "cardiac silhouette", "mediastinum", "pleura"],
+}
+
+
+def normalize_dataset_name(dataset: str) -> str:
+    normalized = dataset.lower().replace("-", "").replace("_", "")
+    if normalized == "deepeyenet":
+        return "deepeyenet"
+    if normalized in {"iuxray", "iuchestxray", "indianaxray"}:
+        return "iuxray"
+    raise ValueError(f"Unsupported dataset '{dataset}'. Use 'deepeyenet' or 'iuxray'.")
+
+
+def get_anatomy_names(dataset: str) -> list[str]:
+    return ANATOMY_NODES[normalize_dataset_name(dataset)]
+
+
+def anatomy_prior_matrix(dataset: str, patch_grid: int) -> torch.Tensor:
+    """Return a deterministic region-to-anatomy prior for weakly supervised data."""
+    dataset = normalize_dataset_name(dataset)
+    anatomy = get_anatomy_names(dataset)
+    prior = torch.zeros(patch_grid * patch_grid, len(anatomy), dtype=torch.float32)
+    for y in range(patch_grid):
+        for x in range(patch_grid):
+            r = y * patch_grid + x
+            yn = (y + 0.5) / patch_grid
+            xn = (x + 0.5) / patch_grid
+            if dataset == "deepeyenet":
+                names = {name: i for i, name in enumerate(anatomy)}
+                prior[r, names["superior retina"]] = max(0.05, 1.0 - yn)
+                prior[r, names["inferior retina"]] = max(0.05, yn)
+                prior[r, names["nasal retina"]] = max(0.05, 1.0 - xn)
+                prior[r, names["temporal retina"]] = max(0.05, xn)
+                dist_macula = ((xn - 0.50) ** 2 + (yn - 0.50) ** 2) ** 0.5
+                dist_disc = ((xn - 0.28) ** 2 + (yn - 0.50) ** 2) ** 0.5
+                prior[r, names["macula"]] = max(0.05, 1.0 - 3.0 * dist_macula)
+                prior[r, names["optic disc"]] = max(0.05, 1.0 - 3.0 * dist_disc)
+                prior[r, names["retinal vessels"]] = max(0.05, 1.0 - 2.2 * abs(yn - 0.50))
+            else:
+                names = {name: i for i, name in enumerate(anatomy)}
+                left = xn < 0.5
+                upper = yn < 0.5
+                lung_name = f"{'left' if left else 'right'} {'upper' if upper else 'lower'} lung"
+                prior[r, names[lung_name]] = 1.0
+                prior[r, names["cardiac silhouette"]] = max(0.05, 1.0 - 4.0 * (((xn - 0.50) ** 2 + (yn - 0.66) ** 2) ** 0.5))
+                prior[r, names["mediastinum"]] = max(0.05, 1.0 - 5.0 * abs(xn - 0.50))
+                border = min(xn, 1.0 - xn, yn, 1.0 - yn)
+                prior[r, names["pleura"]] = max(0.05, 1.0 - 4.0 * border)
+    prior = prior / prior.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    return prior
+
+
 def _parse_keywords(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(v) for v in value]
@@ -289,7 +343,7 @@ def load_iuxray_split_records(data_root: str | Path, split: str, seed: int = 42)
 
 
 def load_split_records(data_root: str | Path, split: str, dataset: str = "deepeyenet", seed: int = 42) -> list[dict[str, Any]]:
-    dataset = dataset.lower().replace("-", "").replace("_", "")
+    dataset = normalize_dataset_name(dataset)
     if dataset == "deepeyenet":
         return load_deepeyenet_split_records(data_root, split)
     if dataset in {"iuxray", "iuchestxray", "indianaxray"}:

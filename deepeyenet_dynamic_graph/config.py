@@ -21,6 +21,9 @@ class Config:
     embed_dim: int = 256
     hidden_dim: int = 256
     graph_steps: int = 1
+    use_anatomy: bool = True
+    disable_counterfactuals: bool = False
+    max_interactive_examples: int = 12
     dropout: float = 0.2
     batch_size: int = 8
     epochs: int = 15

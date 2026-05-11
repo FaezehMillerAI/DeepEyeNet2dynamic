@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .config import Config
-from .data import MedicalReportDataset, collate_fn
+from .data import MedicalReportDataset, anatomy_prior_matrix, collate_fn, get_anatomy_names
 from .metrics import concept_metrics, graph_metrics, language_metrics
 from .model import DynamicGraphCaptioner
 from .utils import ensure_dir, get_device, load_json, save_json
@@ -20,6 +20,7 @@ from .visualize import (
     plot_dynamic_graph,
     plot_evidence_heatmap,
     plot_metric_bars,
+    write_interactive_explanations,
 )
 from .vocab import Vocabulary
 
@@ -35,23 +36,41 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-report-len", type=int, default=None)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--no-counterfactuals", action="store_true")
+    parser.add_argument("--max-interactive-examples", type=int, default=None)
     return parser.parse_args()
 
 
-def _mask_top_regions(images: torch.Tensor, rc_edges: torch.Tensor, concept_ids: torch.Tensor, patch_grid: int) -> torch.Tensor:
+def _top_region_ids(rc_edges: torch.Tensor, concept_ids: torch.Tensor) -> torch.Tensor:
+    ids = []
+    for b in range(rc_edges.shape[0]):
+        concept_id = int(concept_ids[b])
+        region_scores = rc_edges[b, :, :, concept_id].mean(dim=0)
+        ids.append(int(region_scores.argmax()))
+    return torch.tensor(ids, device=rc_edges.device, dtype=torch.long)
+
+
+def _mask_regions(images: torch.Tensor, region_ids: torch.Tensor, patch_grid: int) -> torch.Tensor:
     masked = images.clone()
     batch, _, height, width = images.shape
     patch_h = height // patch_grid
     patch_w = width // patch_grid
     for b in range(batch):
-        concept_id = int(concept_ids[b])
-        region_scores = rc_edges[b, :, :, concept_id].mean(dim=0)
-        region_id = int(region_scores.argmax())
+        region_id = int(region_ids[b])
         row, col = divmod(region_id, patch_grid)
         y0, y1 = row * patch_h, (row + 1) * patch_h
         x0, x1 = col * patch_w, (col + 1) * patch_w
         masked[b, :, y0:y1, x0:x1] = 0.0
     return masked
+
+
+def _top_anatomy_ids(region_anatomy_edges: torch.Tensor | None, region_ids: torch.Tensor) -> torch.Tensor | None:
+    if region_anatomy_edges is None:
+        return None
+    ids = []
+    for b in range(region_anatomy_edges.shape[0]):
+        ids.append(int(region_anatomy_edges[b, int(region_ids[b])].argmax()))
+    return torch.tensor(ids, device=region_anatomy_edges.device, dtype=torch.long)
 
 
 @torch.no_grad()
@@ -61,7 +80,9 @@ def evaluate_model(model, loader, vocab: Vocabulary, concepts: list[str], cfg: C
     all_true, all_prob = [], []
     all_rc, all_tc = [], []
     temporal_drifts = []
-    faithfulness_drops = []
+    patch_drops = []
+    anatomy_drops = []
+    finding_drops = []
     examples = []
 
     for batch in tqdm(loader, desc="evaluate"):
@@ -83,11 +104,25 @@ def evaluate_model(model, loader, vocab: Vocabulary, concepts: list[str], cfg: C
             temporal_drifts.extend(drift.cpu().tolist())
 
         concept_ids = probs.argmax(dim=1)
-        masked = _mask_top_regions(images, teacher_output.rc_edges, concept_ids, cfg.patch_grid)
-        masked_output = model(masked, tokens)
-        masked_probs = torch.sigmoid(masked_output.concept_logits)
-        drops = probs.gather(1, concept_ids[:, None]) - masked_probs.gather(1, concept_ids[:, None])
-        faithfulness_drops.extend(drops.squeeze(1).cpu().tolist())
+        region_ids = _top_region_ids(teacher_output.rc_edges, concept_ids)
+        anatomy_ids = _top_anatomy_ids(teacher_output.region_anatomy_edges, region_ids)
+        if not cfg.disable_counterfactuals:
+            masked = _mask_regions(images, region_ids, cfg.patch_grid)
+            masked_output = model(masked, tokens)
+            masked_probs = torch.sigmoid(masked_output.concept_logits)
+            drops = probs.gather(1, concept_ids[:, None]) - masked_probs.gather(1, concept_ids[:, None])
+            patch_drops.extend(drops.squeeze(1).cpu().tolist())
+
+            if anatomy_ids is not None:
+                anatomy_output = model(images, tokens, suppress_anatomy_ids=anatomy_ids)
+                anatomy_probs = torch.sigmoid(anatomy_output.concept_logits)
+                drops = probs.gather(1, concept_ids[:, None]) - anatomy_probs.gather(1, concept_ids[:, None])
+                anatomy_drops.extend(drops.squeeze(1).cpu().tolist())
+
+            finding_output = model(images, tokens, suppress_concept_ids=concept_ids)
+            finding_probs = torch.sigmoid(finding_output.concept_logits)
+            drops = probs.gather(1, concept_ids[:, None]) - finding_probs.gather(1, concept_ids[:, None])
+            finding_drops.extend(drops.squeeze(1).cpu().tolist())
 
         for i in range(min(3, images.shape[0])):
             if len(examples) >= 6:
@@ -101,6 +136,10 @@ def evaluate_model(model, loader, vocab: Vocabulary, concepts: list[str], cfg: C
                     "concept_prob": probs[i].cpu().numpy(),
                     "rc_edges": teacher_output.rc_edges[i].cpu().numpy(),
                     "token_concept_edges": teacher_output.token_concept_edges[i].cpu().numpy(),
+                    "region_anatomy_edges": None if teacher_output.region_anatomy_edges is None else teacher_output.region_anatomy_edges[i].cpu().numpy(),
+                    "patch_cf_drop": float(patch_drops[-images.shape[0] + i]) if patch_drops and len(patch_drops) >= images.shape[0] else 0.0,
+                    "anatomy_cf_drop": float(anatomy_drops[-images.shape[0] + i]) if anatomy_drops and len(anatomy_drops) >= images.shape[0] else 0.0,
+                    "finding_cf_drop": float(finding_drops[-images.shape[0] + i]) if finding_drops and len(finding_drops) >= images.shape[0] else 0.0,
                 }
             )
 
@@ -112,8 +151,13 @@ def evaluate_model(model, loader, vocab: Vocabulary, concepts: list[str], cfg: C
     metrics.update(language_metrics(references, hypotheses))
     metrics.update(concept_metrics(y_true, y_prob))
     metrics.update(graph_metrics(rc, tc, y_true, topk=cfg.topk_evidence, temporal_drifts=np.asarray(temporal_drifts)))
-    metrics["faithfulness_confidence_drop_mean"] = float(np.mean(faithfulness_drops)) if faithfulness_drops else 0.0
-    metrics["faithfulness_confidence_drop_median"] = float(np.median(faithfulness_drops)) if faithfulness_drops else 0.0
+    metrics["patch_counterfactual_drop_mean"] = float(np.mean(patch_drops)) if patch_drops else 0.0
+    metrics["patch_counterfactual_drop_median"] = float(np.median(patch_drops)) if patch_drops else 0.0
+    metrics["patch_counterfactual_positive_rate"] = float(np.mean(np.asarray(patch_drops) > 0)) if patch_drops else 0.0
+    metrics["anatomy_counterfactual_drop_mean"] = float(np.mean(anatomy_drops)) if anatomy_drops else 0.0
+    metrics["anatomy_counterfactual_positive_rate"] = float(np.mean(np.asarray(anatomy_drops) > 0)) if anatomy_drops else 0.0
+    metrics["finding_counterfactual_drop_mean"] = float(np.mean(finding_drops)) if finding_drops else 0.0
+    metrics["finding_counterfactual_positive_rate"] = float(np.mean(np.asarray(finding_drops) > 0)) if finding_drops else 0.0
 
     save_json(metrics, output_dir / "metrics.json")
     save_json(
@@ -122,8 +166,10 @@ def evaluate_model(model, loader, vocab: Vocabulary, concepts: list[str], cfg: C
     )
     plot_metric_bars(metrics, output_dir / "metric_summary.png")
     plot_concept_confusion(y_true, y_prob, concepts, output_dir / "concept_confusion_top20.png")
-    plot_counterfactual_curve(faithfulness_drops, output_dir / "counterfactual_evidence_drop.png")
+    plot_counterfactual_curve(patch_drops, output_dir / "counterfactual_evidence_drop.png")
 
+    interactive_examples = []
+    anatomy_names = getattr(model, "anatomy_names", [])
     for idx, ex in enumerate(examples):
         concept_scores = ex["concept_prob"]
         top_concept = int(np.argmax(concept_scores))
@@ -132,6 +178,39 @@ def evaluate_model(model, loader, vocab: Vocabulary, concepts: list[str], cfg: C
         if full_image_path.exists():
             plot_evidence_heatmap(full_image_path, region_scores, cfg.patch_grid, output_dir / f"example_{idx}_evidence_heatmap.png")
         plot_dynamic_graph(region_scores, concept_scores, concepts, output_dir / f"example_{idx}_dynamic_graph.png")
+        if idx < cfg.max_interactive_examples and full_image_path.exists():
+            rc_mean = ex["rc_edges"].mean(axis=0)
+            patches = []
+            for patch_id in range(cfg.patch_grid * cfg.patch_grid):
+                top_concepts = np.argsort(-rc_mean[patch_id])[: min(3, len(concepts))]
+                anatomy = "region"
+                if ex["region_anatomy_edges"] is not None and anatomy_names:
+                    anatomy_id = int(np.argmax(ex["region_anatomy_edges"][patch_id]))
+                    anatomy = anatomy_names[anatomy_id]
+                patches.append(
+                    {
+                        "patch_id": patch_id,
+                        "anatomy": anatomy,
+                        "top_concepts": [{"name": concepts[int(c)], "score": float(rc_mean[patch_id, int(c)])} for c in top_concepts],
+                        "linked_report_text": ex["prediction"],
+                        "patch_counterfactual_drop": ex["patch_cf_drop"] if patch_id == int(np.argmax(region_scores)) else 0.0,
+                        "anatomy_counterfactual_drop": ex["anatomy_cf_drop"] if patch_id == int(np.argmax(region_scores)) else 0.0,
+                        "finding_counterfactual_drop": ex["finding_cf_drop"] if patch_id == int(np.argmax(region_scores)) else 0.0,
+                    }
+                )
+            interactive_examples.append(
+                {
+                    "image_path": ex["image_path"],
+                    "image_src": str(full_image_path),
+                    "patch_grid": cfg.patch_grid,
+                    "reference": ex["reference"],
+                    "prediction": ex["prediction"],
+                    "keywords": ex["keywords"],
+                    "patches": patches,
+                }
+            )
+    save_json(interactive_examples, output_dir / "interactive_explanations.json")
+    write_interactive_explanations(interactive_examples, output_dir / "interactive_explanations.html")
 
     return metrics
 
@@ -150,6 +229,10 @@ def main() -> None:
     cfg.device = args.device
     if args.max_report_len is not None:
         cfg.max_report_len = args.max_report_len
+    if args.no_counterfactuals:
+        cfg.disable_counterfactuals = True
+    if args.max_interactive_examples is not None:
+        cfg.max_interactive_examples = args.max_interactive_examples
     output_dir = ensure_dir(args.output_dir)
     device = get_device(cfg.device)
 
@@ -169,9 +252,14 @@ def main() -> None:
         cfg.patch_grid,
         cfg.dropout,
         cfg.graph_steps,
+        get_anatomy_names(cfg.dataset),
+        anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
+        cfg.use_anatomy,
     ).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt["model"])
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    if missing or unexpected:
+        print(f"Loaded checkpoint with missing={len(missing)} unexpected={len(unexpected)} keys. This is expected when evaluating older checkpoints after architecture upgrades.")
     metrics = evaluate_model(model, loader, vocab, concepts, cfg, device, Path(cfg.data_root), output_dir)
     print(metrics)
     print(f"Saved evaluation artifacts to {output_dir}")

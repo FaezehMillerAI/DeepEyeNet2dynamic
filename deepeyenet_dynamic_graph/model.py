@@ -15,6 +15,9 @@ class DecodeOutput:
     token_concept_edges: torch.Tensor
     region_features: torch.Tensor
     concept_features: torch.Tensor
+    region_anatomy_edges: torch.Tensor | None = None
+    anatomy_concept_edges: torch.Tensor | None = None
+    anatomy_features: torch.Tensor | None = None
 
 
 class RegionEncoder(nn.Module):
@@ -67,6 +70,9 @@ class DynamicGraphCaptioner(nn.Module):
         patch_grid: int = 4,
         dropout: float = 0.2,
         graph_steps: int = 1,
+        anatomy_names: list[str] | None = None,
+        region_anatomy_prior: torch.Tensor | None = None,
+        use_anatomy: bool = True,
     ) -> None:
         super().__init__()
         self.concept_names = concept_names
@@ -75,11 +81,16 @@ class DynamicGraphCaptioner(nn.Module):
         self.bos_id = bos_id
         self.eos_id = eos_id
         self.graph_steps = graph_steps
+        self.anatomy_names = anatomy_names or []
+        self.num_anatomy = len(self.anatomy_names)
+        self.use_anatomy = use_anatomy and self.num_anatomy > 0
 
         self.region_encoder = RegionEncoder(embed_dim, patch_grid=patch_grid, dropout=dropout)
         self.token_embed = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_id)
         self.concept_embed = nn.Parameter(torch.randn(self.num_concepts, embed_dim) * 0.02)
+        self.anatomy_embed = nn.Parameter(torch.randn(max(1, self.num_anatomy), embed_dim) * 0.02)
         self.region_proj = nn.Linear(embed_dim, embed_dim)
+        self.anatomy_proj = nn.Linear(embed_dim, embed_dim)
         self.concept_proj = nn.Linear(embed_dim, embed_dim)
         self.graph_msg = nn.Linear(embed_dim, embed_dim)
         self.init_hidden = nn.Linear(embed_dim, hidden_dim)
@@ -88,6 +99,9 @@ class DynamicGraphCaptioner(nn.Module):
         self.out = nn.Linear(hidden_dim, vocab_size)
         self.concept_head = nn.Linear(embed_dim, 1)
         self.dropout = nn.Dropout(dropout)
+        if region_anatomy_prior is None:
+            region_anatomy_prior = torch.full((patch_grid * patch_grid, max(1, self.num_anatomy)), 1.0 / max(1, self.num_anatomy))
+        self.register_buffer("region_anatomy_prior", region_anatomy_prior.float())
 
     def compute_region_concept_edges(
         self, region_features: torch.Tensor, concept_features: torch.Tensor, hidden: torch.Tensor | None = None
@@ -99,19 +113,65 @@ class DynamicGraphCaptioner(nn.Module):
         scores = torch.matmul(r, c.transpose(1, 2)) / (r.shape[-1] ** 0.5)
         return F.softmax(scores, dim=-1)
 
-    def propagate_graph(self, region_features: torch.Tensor, concept_features: torch.Tensor, rc_edges: torch.Tensor) -> torch.Tensor:
-        concept_msg = torch.matmul(rc_edges.transpose(1, 2), region_features)
-        concept_msg = concept_msg / max(1, region_features.shape[1])
+    def compute_region_anatomy_edges(self, region_features: torch.Tensor) -> torch.Tensor:
+        if not self.use_anatomy:
+            batch = region_features.shape[0]
+            return torch.zeros(batch, region_features.shape[1], max(1, self.num_anatomy), device=region_features.device)
+        anatomy_features = self.anatomy_embed[: self.num_anatomy].unsqueeze(0).expand(region_features.shape[0], -1, -1)
+        scores = torch.matmul(self.region_proj(region_features), self.anatomy_proj(anatomy_features).transpose(1, 2))
+        scores = scores / (region_features.shape[-1] ** 0.5)
+        prior = self.region_anatomy_prior[:, : self.num_anatomy].to(region_features.device).clamp_min(1e-8).log().unsqueeze(0)
+        return F.softmax(scores + prior, dim=-1)
+
+    def compute_anatomy_concept_edges(self, anatomy_features: torch.Tensor, concept_features: torch.Tensor) -> torch.Tensor:
+        scores = torch.matmul(self.anatomy_proj(anatomy_features), self.concept_proj(concept_features).transpose(1, 2))
+        scores = scores / (anatomy_features.shape[-1] ** 0.5)
+        return F.softmax(scores, dim=-1)
+
+    def build_graph_features(
+        self,
+        region_features: torch.Tensor,
+        concept_features: torch.Tensor,
+        suppress_anatomy_ids: torch.Tensor | None = None,
+        suppress_concept_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+        if self.use_anatomy:
+            ra_edges = self.compute_region_anatomy_edges(region_features)
+            anatomy_features = self.anatomy_embed[: self.num_anatomy].unsqueeze(0).expand(region_features.shape[0], -1, -1)
+            anatomy_msg = torch.matmul(ra_edges.transpose(1, 2), region_features) / max(1, region_features.shape[1])
+            anatomy_features = F.gelu(anatomy_features + self.graph_msg(anatomy_msg))
+            if suppress_anatomy_ids is not None:
+                anatomy_features = anatomy_features.clone()
+                for b, anatomy_id in enumerate(suppress_anatomy_ids.tolist()):
+                    anatomy_features[b, int(anatomy_id)] = 0.0
+            ac_edges = self.compute_anatomy_concept_edges(anatomy_features, concept_features)
+            concept_msg = torch.matmul(ac_edges.transpose(1, 2), anatomy_features) / max(1, self.num_anatomy)
+            rc_edges = torch.matmul(ra_edges, ac_edges)
+        else:
+            ra_edges = None
+            ac_edges = None
+            anatomy_features = None
+            rc_edges = self.compute_region_concept_edges(region_features, concept_features)
+            concept_msg = torch.matmul(rc_edges.transpose(1, 2), region_features) / max(1, region_features.shape[1])
         for _ in range(self.graph_steps):
             concept_features = F.gelu(concept_features + self.graph_msg(concept_msg))
-        return concept_features
+        if suppress_concept_ids is not None:
+            concept_features = concept_features.clone()
+            for b, concept_id in enumerate(suppress_concept_ids.tolist()):
+                concept_features[b, int(concept_id)] = 0.0
+        return concept_features, ra_edges, ac_edges, anatomy_features, rc_edges
 
-    def forward(self, images: torch.Tensor, tokens: torch.Tensor) -> DecodeOutput:
+    def forward(
+        self,
+        images: torch.Tensor,
+        tokens: torch.Tensor,
+        suppress_anatomy_ids: torch.Tensor | None = None,
+        suppress_concept_ids: torch.Tensor | None = None,
+    ) -> DecodeOutput:
         batch, seq_len = tokens.shape
         region_features = self.region_encoder(images)
         concept_features = self.concept_embed.unsqueeze(0).expand(batch, -1, -1)
-        rc0 = self.compute_region_concept_edges(region_features, concept_features)
-        concept_features = self.propagate_graph(region_features, concept_features, rc0)
+        concept_features, ra_edges, ac_edges, anatomy_features, rc0 = self.build_graph_features(region_features, concept_features, suppress_anatomy_ids, suppress_concept_ids)
         pooled = region_features.mean(dim=1)
         hidden = torch.tanh(self.init_hidden(pooled))
 
@@ -135,7 +195,7 @@ class DynamicGraphCaptioner(nn.Module):
         rc_edges_t = torch.stack(rc_edges, dim=1)
         token_concept_t = torch.stack(token_concept_edges, dim=1)
         concept_logits = self.concept_head(concept_features).squeeze(-1)
-        return DecodeOutput(logits_t, concept_logits, rc_edges_t, token_concept_t, region_features, concept_features)
+        return DecodeOutput(logits_t, concept_logits, rc_edges_t, token_concept_t, region_features, concept_features, ra_edges, ac_edges, anatomy_features)
 
     @torch.no_grad()
     def generate(self, images: torch.Tensor, max_len: int = 96) -> DecodeOutput:
@@ -146,8 +206,7 @@ class DynamicGraphCaptioner(nn.Module):
 
         region_features = self.region_encoder(images)
         concept_features = self.concept_embed.unsqueeze(0).expand(batch, -1, -1)
-        rc0 = self.compute_region_concept_edges(region_features, concept_features)
-        concept_features = self.propagate_graph(region_features, concept_features, rc0)
+        concept_features, ra_edges, ac_edges, anatomy_features, rc0 = self.build_graph_features(region_features, concept_features)
         hidden = torch.tanh(self.init_hidden(region_features.mean(dim=1)))
 
         logits = []
@@ -176,6 +235,9 @@ class DynamicGraphCaptioner(nn.Module):
             torch.stack(token_concept_edges, dim=1),
             region_features,
             concept_features,
+            ra_edges,
+            ac_edges,
+            anatomy_features,
         ), gen_tokens
 
 

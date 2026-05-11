@@ -7,7 +7,7 @@ import torch
 from PIL import Image
 
 from .config import Config
-from .data import make_transforms
+from .data import anatomy_prior_matrix, get_anatomy_names, make_transforms
 from .model import DynamicGraphCaptioner
 from .utils import get_device, load_json
 from .vocab import Vocabulary
@@ -42,9 +42,12 @@ def main() -> None:
         cfg.patch_grid,
         cfg.dropout,
         cfg.graph_steps,
+        get_anatomy_names(cfg.dataset),
+        anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
+        cfg.use_anatomy,
     ).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
     transform = make_transforms(cfg.image_size, train=False)
     image = transform(Image.open(args.image).convert("RGB")).unsqueeze(0).to(device)
