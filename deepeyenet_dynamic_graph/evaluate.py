@@ -10,9 +10,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .config import Config
-from .data import MedicalReportDataset, anatomy_prior_matrix, collate_fn, get_anatomy_names
+from .data import HFMedicalReportDataset, MedicalReportDataset, anatomy_prior_matrix, collate_fn, collate_hf_fn, get_anatomy_names
 from .metrics import concept_metrics, graph_metrics, language_metrics
-from .model import DynamicGraphCaptioner
+from .model import DynamicGraphCaptioner, GraphPrefixLLMCaptioner
 from .utils import ensure_dir, get_device, load_json, save_json
 from .visualize import (
     plot_concept_confusion,
@@ -73,8 +73,14 @@ def _top_anatomy_ids(region_anatomy_edges: torch.Tensor | None, region_ids: torc
     return torch.tensor(ids, device=region_anatomy_edges.device, dtype=torch.long)
 
 
+def _decode_text(decoder, ids: list[int]) -> str:
+    if hasattr(decoder, "itos"):
+        return decoder.decode(ids)
+    return decoder.decode(ids, skip_special_tokens=True)
+
+
 @torch.no_grad()
-def evaluate_model(model, loader, vocab: Vocabulary, concepts: list[str], cfg: Config, device: torch.device, data_root: Path, output_dir: Path) -> dict:
+def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config, device: torch.device, data_root: Path, output_dir: Path) -> dict:
     model.eval()
     references, hypotheses = [], []
     all_true, all_prob = [], []
@@ -88,9 +94,15 @@ def evaluate_model(model, loader, vocab: Vocabulary, concepts: list[str], cfg: C
     for batch in tqdm(loader, desc="evaluate"):
         images = batch["image"].to(device)
         tokens = batch["tokens"].to(device)
+        attention_mask = batch.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
         output, gen_tokens = model.generate(images, max_len=cfg.max_report_len)
-        teacher_output = model(images, tokens)
-        pred_texts = [vocab.decode(row.tolist()) for row in gen_tokens.cpu()]
+        if attention_mask is not None:
+            teacher_output = model(images, tokens, attention_mask=attention_mask)
+        else:
+            teacher_output = model(images, tokens)
+        pred_texts = [_decode_text(text_decoder, row.tolist()) for row in gen_tokens.cpu()]
         references.extend(batch["report_text"])
         hypotheses.extend(pred_texts)
 
@@ -108,18 +120,18 @@ def evaluate_model(model, loader, vocab: Vocabulary, concepts: list[str], cfg: C
         anatomy_ids = _top_anatomy_ids(teacher_output.region_anatomy_edges, region_ids)
         if not cfg.disable_counterfactuals:
             masked = _mask_regions(images, region_ids, cfg.patch_grid)
-            masked_output = model(masked, tokens)
+            masked_output = model(masked, tokens, attention_mask=attention_mask) if attention_mask is not None else model(masked, tokens)
             masked_probs = torch.sigmoid(masked_output.concept_logits)
             drops = probs.gather(1, concept_ids[:, None]) - masked_probs.gather(1, concept_ids[:, None])
             patch_drops.extend(drops.squeeze(1).cpu().tolist())
 
             if anatomy_ids is not None:
-                anatomy_output = model(images, tokens, suppress_anatomy_ids=anatomy_ids)
+                anatomy_output = model(images, tokens, attention_mask=attention_mask, suppress_anatomy_ids=anatomy_ids) if attention_mask is not None else model(images, tokens, suppress_anatomy_ids=anatomy_ids)
                 anatomy_probs = torch.sigmoid(anatomy_output.concept_logits)
                 drops = probs.gather(1, concept_ids[:, None]) - anatomy_probs.gather(1, concept_ids[:, None])
                 anatomy_drops.extend(drops.squeeze(1).cpu().tolist())
 
-            finding_output = model(images, tokens, suppress_concept_ids=concept_ids)
+            finding_output = model(images, tokens, attention_mask=attention_mask, suppress_concept_ids=concept_ids) if attention_mask is not None else model(images, tokens, suppress_concept_ids=concept_ids)
             finding_probs = torch.sigmoid(finding_output.concept_logits)
             drops = probs.gather(1, concept_ids[:, None]) - finding_probs.gather(1, concept_ids[:, None])
             finding_drops.extend(drops.squeeze(1).cpu().tolist())
@@ -221,6 +233,8 @@ def main() -> None:
     run_dir = checkpoint_path.parent
     cfg_path = run_dir / "config.json"
     cfg = Config.load(cfg_path) if cfg_path.exists() else Config(data_root=args.data_root)
+    if not (run_dir / "tokenizer.json").exists() and (run_dir / "vocab.json").exists():
+        cfg.decoder_type = "gru"
     cfg.data_root = args.data_root
     if args.dataset is not None:
         cfg.dataset = args.dataset
@@ -236,31 +250,59 @@ def main() -> None:
     output_dir = ensure_dir(args.output_dir)
     device = get_device(cfg.device)
 
-    vocab = Vocabulary.from_dict(load_json(run_dir / "vocab.json"))
     concepts = load_json(run_dir / "concepts.json")["concepts"]
-    dataset = MedicalReportDataset(cfg.data_root, args.split, vocab, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
-    loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=functools.partial(collate_fn, pad_id=vocab.pad_id))
+    if cfg.decoder_type == "llm":
+        from transformers import AutoTokenizer
 
-    model = DynamicGraphCaptioner(
-        len(vocab.itos),
-        concepts,
-        vocab.pad_id,
-        vocab.bos_id,
-        vocab.eos_id,
-        cfg.embed_dim,
-        cfg.hidden_dim,
-        cfg.patch_grid,
-        cfg.dropout,
-        cfg.graph_steps,
-        get_anatomy_names(cfg.dataset),
-        anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
-        cfg.use_anatomy,
-    ).to(device)
+        tokenizer = AutoTokenizer.from_pretrained(cfg.llm_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        dataset = HFMedicalReportDataset(cfg.data_root, args.split, tokenizer, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
+        loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=functools.partial(collate_hf_fn, pad_id=tokenizer.pad_token_id))
+        bos_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
+        model = GraphPrefixLLMCaptioner(
+            cfg.llm_name,
+            concepts,
+            tokenizer.pad_token_id,
+            bos_id,
+            tokenizer.eos_token_id,
+            cfg.embed_dim,
+            cfg.hidden_dim,
+            cfg.patch_grid,
+            cfg.dropout,
+            cfg.graph_steps,
+            get_anatomy_names(cfg.dataset),
+            anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
+            cfg.use_anatomy,
+            cfg.freeze_llm,
+            cfg.prefix_length,
+        ).to(device)
+        text_decoder = tokenizer
+    else:
+        vocab = Vocabulary.from_dict(load_json(run_dir / "vocab.json"))
+        dataset = MedicalReportDataset(cfg.data_root, args.split, vocab, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
+        loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=functools.partial(collate_fn, pad_id=vocab.pad_id))
+        model = DynamicGraphCaptioner(
+            len(vocab.itos),
+            concepts,
+            vocab.pad_id,
+            vocab.bos_id,
+            vocab.eos_id,
+            cfg.embed_dim,
+            cfg.hidden_dim,
+            cfg.patch_grid,
+            cfg.dropout,
+            cfg.graph_steps,
+            get_anatomy_names(cfg.dataset),
+            anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
+            cfg.use_anatomy,
+        ).to(device)
+        text_decoder = vocab
     ckpt = torch.load(checkpoint_path, map_location=device)
     missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
     if missing or unexpected:
         print(f"Loaded checkpoint with missing={len(missing)} unexpected={len(unexpected)} keys. This is expected when evaluating older checkpoints after architecture upgrades.")
-    metrics = evaluate_model(model, loader, vocab, concepts, cfg, device, Path(cfg.data_root), output_dir)
+    metrics = evaluate_model(model, loader, text_decoder, concepts, cfg, device, Path(cfg.data_root), output_dir)
     print(metrics)
     print(f"Saved evaluation artifacts to {output_dir}")
 

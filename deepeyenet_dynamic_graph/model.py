@@ -18,6 +18,7 @@ class DecodeOutput:
     region_anatomy_edges: torch.Tensor | None = None
     anatomy_concept_edges: torch.Tensor | None = None
     anatomy_features: torch.Tensor | None = None
+    lm_loss: torch.Tensor | None = None
 
 
 class RegionEncoder(nn.Module):
@@ -251,8 +252,11 @@ def compute_losses(
     lambda_sparse: float = 0.01,
     lambda_temp: float = 0.05,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    lm_targets = target_tokens[:, 1 : output.logits.shape[1] + 1]
-    rep_loss = F.cross_entropy(output.logits.reshape(-1, output.logits.shape[-1]), lm_targets.reshape(-1), ignore_index=pad_id)
+    if output.lm_loss is not None:
+        rep_loss = output.lm_loss
+    else:
+        lm_targets = target_tokens[:, 1 : output.logits.shape[1] + 1]
+        rep_loss = F.cross_entropy(output.logits.reshape(-1, output.logits.shape[-1]), lm_targets.reshape(-1), ignore_index=pad_id)
     concept_loss = F.binary_cross_entropy_with_logits(output.concept_logits, concept_targets)
     concept_probs = torch.sigmoid(output.concept_logits)
     align_loss = F.binary_cross_entropy(concept_probs.clamp(1e-4, 1 - 1e-4), concept_targets)
@@ -270,3 +274,155 @@ def compute_losses(
         "sparse_loss": float(sparse_loss.detach().cpu()),
         "temp_loss": float(temp_loss.detach().cpu()),
     }
+
+
+class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
+    """Anatomy-aware graph encoder coupled to a causal LLM via soft prefixes."""
+
+    def __init__(
+        self,
+        llm_name: str,
+        concept_names: list[str],
+        pad_id: int,
+        bos_id: int,
+        eos_id: int,
+        embed_dim: int = 256,
+        hidden_dim: int = 256,
+        patch_grid: int = 4,
+        dropout: float = 0.2,
+        graph_steps: int = 1,
+        anatomy_names: list[str] | None = None,
+        region_anatomy_prior: torch.Tensor | None = None,
+        use_anatomy: bool = True,
+        freeze_llm: bool = False,
+        prefix_length: int = 4,
+    ) -> None:
+        from transformers import AutoModelForCausalLM
+
+        dummy_vocab_size = max(int(pad_id or 0), int(bos_id or 0), int(eos_id or 0), 8) + 1
+        super().__init__(
+            vocab_size=dummy_vocab_size,
+            concept_names=concept_names,
+            pad_id=pad_id,
+            bos_id=bos_id,
+            eos_id=eos_id,
+            embed_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            patch_grid=patch_grid,
+            dropout=dropout,
+            graph_steps=graph_steps,
+            anatomy_names=anatomy_names,
+            region_anatomy_prior=region_anatomy_prior,
+            use_anatomy=use_anatomy,
+        )
+        self.llm_name = llm_name
+        self.llm = AutoModelForCausalLM.from_pretrained(llm_name)
+        self.llm_dim = self.llm.config.hidden_size
+        self.prefix_length = prefix_length
+        self.prefix_offset = nn.Parameter(torch.randn(prefix_length, self.llm_dim) * 0.02)
+        self.prefix_proj = nn.Sequential(
+            nn.Linear(embed_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.llm_dim),
+        )
+        if freeze_llm:
+            for param in self.llm.parameters():
+                param.requires_grad = False
+
+    def _graph_prefix(
+        self,
+        region_features: torch.Tensor,
+        concept_features: torch.Tensor,
+        anatomy_features: torch.Tensor | None,
+        rc_edges: torch.Tensor,
+    ) -> torch.Tensor:
+        batch = region_features.shape[0]
+        region_summary = region_features.mean(dim=1)
+        concept_scores = torch.sigmoid(self.concept_head(concept_features).squeeze(-1))
+        concept_summary = torch.matmul(concept_scores.unsqueeze(1), concept_features).squeeze(1)
+        if anatomy_features is None:
+            anatomy_summary = region_summary
+        else:
+            anatomy_summary = anatomy_features.mean(dim=1)
+        base = torch.cat([region_summary, anatomy_summary, concept_summary], dim=-1)
+        prefix = self.prefix_proj(base).unsqueeze(1).expand(batch, self.prefix_length, self.llm_dim)
+        return prefix + self.prefix_offset.unsqueeze(0)
+
+    def _graph_forward(
+        self,
+        images: torch.Tensor,
+        suppress_anatomy_ids: torch.Tensor | None = None,
+        suppress_concept_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+        region_features = self.region_encoder(images)
+        concept_features = self.concept_embed.unsqueeze(0).expand(images.shape[0], -1, -1)
+        concept_features, ra_edges, ac_edges, anatomy_features, rc_edges = self.build_graph_features(
+            region_features,
+            concept_features,
+            suppress_anatomy_ids,
+            suppress_concept_ids,
+        )
+        prefix = self._graph_prefix(region_features, concept_features, anatomy_features, rc_edges)
+        return prefix, region_features, ra_edges, ac_edges, anatomy_features, concept_features
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        tokens: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        suppress_anatomy_ids: torch.Tensor | None = None,
+        suppress_concept_ids: torch.Tensor | None = None,
+    ) -> DecodeOutput:
+        prefix, region_features, ra_edges, ac_edges, anatomy_features, concept_features = self._graph_forward(
+            images, suppress_anatomy_ids, suppress_concept_ids
+        )
+        text_embeds = self.llm.get_input_embeddings()(tokens)
+        inputs_embeds = torch.cat([prefix, text_embeds], dim=1)
+        if attention_mask is None:
+            attention_mask = (tokens != self.pad_id).long()
+        prefix_mask = torch.ones(tokens.shape[0], self.prefix_length, dtype=attention_mask.dtype, device=tokens.device)
+        full_mask = torch.cat([prefix_mask, attention_mask], dim=1)
+        labels = tokens.clone()
+        labels[attention_mask == 0] = -100
+        prefix_labels = torch.full((tokens.shape[0], self.prefix_length), -100, dtype=torch.long, device=tokens.device)
+        labels = torch.cat([prefix_labels, labels], dim=1)
+        lm_out = self.llm(inputs_embeds=inputs_embeds, attention_mask=full_mask, labels=labels)
+        concept_logits = self.concept_head(concept_features).squeeze(-1)
+        rc_edges = torch.matmul(ra_edges, ac_edges) if ra_edges is not None and ac_edges is not None else self.compute_region_concept_edges(region_features, concept_features)
+        steps = max(1, tokens.shape[1] - 1)
+        rc_seq = rc_edges.unsqueeze(1).expand(-1, steps, -1, -1)
+        concept_probs = torch.softmax(concept_logits, dim=-1)
+        token_concept = concept_probs.unsqueeze(1).expand(-1, steps, -1)
+        logits = lm_out.logits[:, self.prefix_length :, :]
+        return DecodeOutput(logits, concept_logits, rc_seq, token_concept, region_features, concept_features, ra_edges, ac_edges, anatomy_features, lm_out.loss)
+
+    @torch.no_grad()
+    def generate(self, images: torch.Tensor, max_len: int = 96) -> tuple[DecodeOutput, torch.Tensor]:
+        prefix, region_features, ra_edges, ac_edges, anatomy_features, concept_features = self._graph_forward(images)
+        batch = images.shape[0]
+        start_id = self.bos_id if self.bos_id is not None and self.bos_id >= 0 else self.eos_id
+        generated = torch.full((batch, 1), start_id, dtype=torch.long, device=images.device)
+        logits_steps = []
+        finished = torch.zeros(batch, dtype=torch.bool, device=images.device)
+        for _ in range(max_len - 1):
+            text_embeds = self.llm.get_input_embeddings()(generated)
+            inputs_embeds = torch.cat([prefix, text_embeds], dim=1)
+            mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=images.device)
+            out = self.llm(inputs_embeds=inputs_embeds, attention_mask=mask)
+            next_logits = out.logits[:, -1, :]
+            next_id = next_logits.argmax(dim=-1)
+            next_id = torch.where(finished, torch.full_like(next_id, self.pad_id), next_id)
+            generated = torch.cat([generated, next_id[:, None]], dim=1)
+            logits_steps.append(next_logits)
+            if self.eos_id is not None:
+                finished |= next_id == self.eos_id
+            if bool(finished.all()):
+                break
+        gen_tokens = generated[:, 1:]
+        concept_logits = self.concept_head(concept_features).squeeze(-1)
+        rc_edges = torch.matmul(ra_edges, ac_edges) if ra_edges is not None and ac_edges is not None else self.compute_region_concept_edges(region_features, concept_features)
+        steps = max(1, gen_tokens.shape[1])
+        rc_seq = rc_edges.unsqueeze(1).expand(-1, steps, -1, -1)
+        token_concept = torch.softmax(concept_logits, dim=-1).unsqueeze(1).expand(-1, steps, -1)
+        logits = torch.stack(logits_steps, dim=1) if logits_steps else torch.empty(batch, 0, self.llm.config.vocab_size, device=images.device)
+        return DecodeOutput(logits, concept_logits, rc_seq, token_concept, region_features, concept_features, ra_edges, ac_edges, anatomy_features), gen_tokens

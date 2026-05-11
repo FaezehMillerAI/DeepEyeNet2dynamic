@@ -9,7 +9,8 @@ The original markdown describes a dynamic explanation graph for chest X-ray repo
 - Region-aware retinal image encoder using fixed spatial patches.
 - Concept vocabulary built from DeepEyeNet `Keywords`.
 - Dynamic region-to-concept graph updated during decoding.
-- GRU report decoder conditioned on visual and graph evidence.
+- LLM report decoder conditioned on the anatomy-aware explanation graph through learned soft-prefix embeddings.
+- Optional GRU decoder baseline with `--decoder-type gru`.
 - Multi-task losses for report generation, concept prediction, graph alignment, sparsity, and temporal consistency.
 - Evaluation suite for text quality, clinical concept fidelity, graph behavior, evidence faithfulness, and counterfactual sensitivity.
 - Publication-oriented visualizations: metric bars, confusion heatmaps, graph diagrams, evidence heatmaps, counterfactual curves, and an interactive hover explanation viewer.
@@ -57,6 +58,8 @@ python -m deepeyenet_dynamic_graph.train \
   --output-dir outputs/run1 \
   --epochs 10 \
   --batch-size 8 \
+  --decoder-type llm \
+  --llm-name distilgpt2 \
   --num-workers 0
 
 python -m deepeyenet_dynamic_graph.evaluate \
@@ -83,6 +86,8 @@ python -m deepeyenet_dynamic_graph.train \
   --output-dir outputs/iuxray_run1 \
   --epochs 10 \
   --batch-size 8 \
+  --decoder-type llm \
+  --llm-name distilgpt2 \
   --num-workers 0
 
 python -m deepeyenet_dynamic_graph.evaluate \
@@ -95,6 +100,38 @@ python -m deepeyenet_dynamic_graph.evaluate \
 ```
 
 The evaluation folder includes `interactive_explanations.html`. Open it in a browser to hover over image regions and inspect anatomy, top findings, linked report text, and counterfactual drops.
+
+## LLM Decoder
+
+The default model is now LLM-based. The explanation graph is converted into learned prefix embeddings:
+
+```text
+image patch -> anatomy node -> finding node -> LLM soft prefix -> generated report
+```
+
+Default lightweight Colab setting:
+
+```bash
+--decoder-type llm --llm-name distilgpt2
+```
+
+Stronger biomedical option:
+
+```bash
+--decoder-type llm --llm-name microsoft/BioGPT
+```
+
+For a cheaper ablation, freeze the LLM and train only the image/graph/prefix modules:
+
+```bash
+--freeze-llm
+```
+
+For the older non-LLM baseline:
+
+```bash
+--decoder-type gru
+```
 
 ## Ablation Examples
 

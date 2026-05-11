@@ -12,3 +12,6 @@ nltk>=3.8.1
 rouge-score>=0.1.2
 bert-score>=0.3.13
 kagglehub>=0.2.9
+transformers>=4.40.0
+accelerate>=0.29.0
+sacremoses>=0.1.1

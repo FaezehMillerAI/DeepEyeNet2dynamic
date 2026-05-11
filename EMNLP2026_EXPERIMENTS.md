@@ -21,11 +21,14 @@ remove patch/anatomy/finding evidence -> measure whether the finding weakens
 Run each experiment on DeepEyeNet and IU-XRay with at least three random seeds.
 
 1. Full anatomy-aware dynamic explanation graph.
-2. No anatomy layer (`--no-anatomy`).
-3. No graph sparsity (`--lambda-sparse 0`).
-4. No temporal graph consistency (`--lambda-temp 0`).
-5. No sparsity and no temporal consistency.
-6. Patch-grid sensitivity (`--patch-grid 3`, `4`, `5`).
+2. Full graph with biomedical LLM decoder (`--decoder-type llm --llm-name microsoft/BioGPT`).
+3. Frozen LLM prefix tuning (`--freeze-llm`).
+4. GRU decoder baseline (`--decoder-type gru`).
+5. No anatomy layer (`--no-anatomy`).
+6. No graph sparsity (`--lambda-sparse 0`).
+7. No temporal graph consistency (`--lambda-temp 0`).
+8. No sparsity and no temporal consistency.
+9. Patch-grid sensitivity (`--patch-grid 3`, `4`, `5`).
 
 ## Metrics
 
@@ -71,4 +74,3 @@ This distinction is crucial for EMNLP reviewers.
 ## Suggested Title
 
 Dynamic Anatomy-Aware Explanation Graphs for Faithful Medical Report Generation
-

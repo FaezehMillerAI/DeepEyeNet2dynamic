@@ -20,6 +20,10 @@ class Config:
     max_concepts: int = 128
     embed_dim: int = 256
     hidden_dim: int = 256
+    decoder_type: str = "llm"
+    llm_name: str = "distilgpt2"
+    freeze_llm: bool = False
+    prefix_length: int = 4
     graph_steps: int = 1
     use_anatomy: bool = True
     disable_counterfactuals: bool = False
