@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 import warnings
+import random
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,6 +22,33 @@ SPLIT_FILES = {
     "valid": ("DeepEyeNet_valid.json", "valid.csv"),
     "test": ("DeepEyeNet_test.json", "test.csv"),
 }
+
+IU_XRAY_TERMS = [
+    "atelectasis",
+    "cardiomegaly",
+    "consolidation",
+    "edema",
+    "effusion",
+    "emphysema",
+    "fibrosis",
+    "fracture",
+    "granuloma",
+    "hernia",
+    "hyperinflation",
+    "infiltrate",
+    "mass",
+    "nodule",
+    "opacity",
+    "pneumonia",
+    "pneumothorax",
+    "scar",
+    "tortuous aorta",
+    "vascular congestion",
+    "pleural thickening",
+    "low lung volume",
+    "calcified granuloma",
+    "hiatal hernia",
+]
 
 
 def _parse_keywords(value: Any) -> list[str]:
@@ -112,7 +141,7 @@ def _records_from_json_raw(raw: Any) -> list[dict[str, Any]]:
     raise ValueError(f"Unsupported JSON metadata structure: {type(raw)!r}")
 
 
-def load_split_records(data_root: str | Path, split: str) -> list[dict[str, Any]]:
+def load_deepeyenet_split_records(data_root: str | Path, split: str) -> list[dict[str, Any]]:
     data_root = Path(data_root)
     json_name, csv_name = SPLIT_FILES[split]
     json_path = data_root / json_name
@@ -146,15 +175,152 @@ def load_split_records(data_root: str | Path, split: str) -> list[dict[str, Any]
     raise FileNotFoundError(f"Could not find {json_path} or {csv_path}.")
 
 
+def _clean_text(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def _iu_report_text(row: pd.Series) -> str:
+    parts = []
+    findings = _clean_text(row.get("findings", ""))
+    impression = _clean_text(row.get("impression", ""))
+    if findings:
+        parts.append(f"Findings: {findings}")
+    if impression:
+        parts.append(f"Impression: {impression}")
+    return " ".join(parts) or _clean_text(row.get("indication", ""))
+
+
+def _iu_keywords(text: str, extra_terms: list[str] | None = None) -> list[str]:
+    text_l = text.lower()
+    terms = list(IU_XRAY_TERMS)
+    if extra_terms:
+        terms.extend(extra_terms)
+    found = []
+    for term in terms:
+        norm = normalize_concept(term)
+        if norm and re.search(rf"\b{re.escape(norm)}\b", text_l):
+            found.append(norm)
+    if any(phrase in text_l for phrase in ["no acute", "normal chest", "no active disease"]):
+        found.append("no acute cardiopulmonary abnormality")
+    return sorted(set(found))
+
+
+def _find_iuxray_images_dir(data_root: Path) -> Path:
+    candidates = [
+        data_root / "images" / "images_normalized",
+        data_root / "images_normalized",
+        data_root / "images",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Could not find IU-XRay images directory under {data_root}.")
+
+
+def _split_uids(uids: list[int], split: str, seed: int = 42) -> set[int]:
+    rng = random.Random(seed)
+    shuffled = list(uids)
+    rng.shuffle(shuffled)
+    n = len(shuffled)
+    train_end = int(0.70 * n)
+    valid_end = train_end + int(0.15 * n)
+    if split == "train":
+        selected = shuffled[:train_end]
+    elif split in {"valid", "val"}:
+        selected = shuffled[train_end:valid_end]
+    elif split == "test":
+        selected = shuffled[valid_end:]
+    else:
+        raise ValueError(f"Unknown split: {split}")
+    return set(selected)
+
+
+def load_iuxray_split_records(data_root: str | Path, split: str, seed: int = 42) -> list[dict[str, Any]]:
+    data_root = Path(data_root)
+    reports_path = data_root / "indiana_reports.csv"
+    if not reports_path.exists():
+        raise FileNotFoundError(f"Could not find IU-XRay reports CSV at {reports_path}.")
+
+    images_dir = _find_iuxray_images_dir(data_root)
+    pattern = re.compile(r"(\d+)_IM-\d+-\d+\.dcm\.png")
+    uid_to_images: dict[int, list[str]] = defaultdict(list)
+    for image_file in images_dir.iterdir():
+        match = pattern.match(image_file.name)
+        if match:
+            uid_to_images[int(match.group(1))].append(image_file.name)
+
+    df = pd.read_csv(reports_path).copy()
+    for col in ["findings", "impression", "indication", "comparison"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("")
+    df = df[(df["findings"].str.len() > 0) | (df["impression"].str.len() > 0)]
+    df["image_files"] = df["uid"].apply(lambda uid: sorted(uid_to_images.get(int(uid), [])))
+    df = df[df["image_files"].apply(len) > 0]
+    selected_uids = _split_uids(sorted(df["uid"].astype(int).unique().tolist()), split, seed=seed)
+    df = df[df["uid"].astype(int).isin(selected_uids)]
+
+    records: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        report = _iu_report_text(row)
+        description = " ".join(
+            part
+            for part in [
+                f"Indication: {_clean_text(row.get('indication', ''))}" if _clean_text(row.get("indication", "")) else "",
+                report,
+            ]
+            if part
+        )
+        keywords = _iu_keywords(report)
+        for image_name in row["image_files"]:
+            image_path = images_dir.relative_to(data_root) / image_name
+            records.append(
+                {
+                    "image_path": str(image_path),
+                    "keywords": keywords,
+                    "clinical_description": description,
+                    "report_text": report,
+                    "uid": int(row["uid"]),
+                }
+            )
+    return records
+
+
+def load_split_records(data_root: str | Path, split: str, dataset: str = "deepeyenet", seed: int = 42) -> list[dict[str, Any]]:
+    dataset = dataset.lower().replace("-", "").replace("_", "")
+    if dataset == "deepeyenet":
+        return load_deepeyenet_split_records(data_root, split)
+    if dataset in {"iuxray", "iuchestxray", "indianaxray"}:
+        return load_iuxray_split_records(data_root, split, seed=seed)
+    raise ValueError(f"Unsupported dataset '{dataset}'. Use 'deepeyenet' or 'iuxray'.")
+
+
+def infer_concepts_from_reports(records: list[dict[str, Any]], max_concepts: int) -> list[str]:
+    counter: Counter[str] = Counter()
+    for record in records:
+        counter.update(record["keywords"])
+        text = str(record.get("report_text", "")).lower()
+        for token in re.findall(r"[a-z][a-z-]{3,}", text):
+            if token not in {"there", "with", "without", "findings", "impression", "comparison", "indication"}:
+                counter[token] += 1
+    return [term for term, _ in counter.most_common(max_concepts)]
+
+
 def build_artifacts(
     data_root: str | Path,
     min_token_freq: int,
     max_vocab_size: int,
     max_concepts: int,
+    dataset: str = "deepeyenet",
+    seed: int = 42,
 ) -> tuple[Vocabulary, list[str]]:
-    train = load_split_records(data_root, "train")
+    train = load_split_records(data_root, "train", dataset=dataset, seed=seed)
     vocab = build_vocab((r["report_text"] for r in train), min_token_freq, max_vocab_size)
     concepts = build_concepts((r["keywords"] for r in train), max_concepts=max_concepts)
+    if not concepts:
+        concepts = infer_concepts_from_reports(train, max_concepts=max_concepts)
     return vocab, concepts
 
 
@@ -179,19 +345,22 @@ def make_transforms(image_size: int, train: bool) -> Callable:
     return transforms.Compose(aug)
 
 
-class DeepEyeNetDataset(Dataset):
+class MedicalReportDataset(Dataset):
     def __init__(
         self,
         data_root: str | Path,
         split: str,
         vocab: Vocabulary,
         concepts: list[str],
+        dataset: str = "deepeyenet",
         image_size: int = 224,
         max_report_len: int = 96,
+        seed: int = 42,
     ) -> None:
         self.data_root = Path(data_root)
         self.split = split
-        self.records = load_split_records(data_root, split)
+        self.dataset = dataset
+        self.records = load_split_records(data_root, split, dataset=dataset, seed=seed)
         self.vocab = vocab
         self.concepts = concepts
         self.concept_to_idx = {c: i for i, c in enumerate(concepts)}
@@ -222,6 +391,9 @@ class DeepEyeNetDataset(Dataset):
             "report_text": rec["report_text"],
             "keywords": rec["keywords"],
         }
+
+
+DeepEyeNetDataset = MedicalReportDataset
 
 
 def collate_fn(batch: list[dict[str, Any]], pad_id: int) -> dict[str, Any]:

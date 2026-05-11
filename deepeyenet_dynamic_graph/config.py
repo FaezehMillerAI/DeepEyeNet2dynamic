@@ -10,6 +10,7 @@ import json
 @dataclass
 class Config:
     data_root: str
+    dataset: str = "deepeyenet"
     output_dir: str = "outputs/deepeyenet_dynamic_graph"
     image_size: int = 224
     patch_grid: int = 4

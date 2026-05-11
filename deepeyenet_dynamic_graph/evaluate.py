@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .config import Config
-from .data import DeepEyeNetDataset, collate_fn
+from .data import MedicalReportDataset, collate_fn
 from .metrics import concept_metrics, graph_metrics, language_metrics
 from .model import DynamicGraphCaptioner
 from .utils import ensure_dir, get_device, load_json, save_json
@@ -27,6 +27,7 @@ from .vocab import Vocabulary
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", required=True)
+    parser.add_argument("--dataset", choices=["deepeyenet", "iuxray"], default=None)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output-dir", default="outputs/deepeyenet_dynamic_graph/eval")
     parser.add_argument("--split", default="test", choices=["train", "valid", "test"])
@@ -142,6 +143,8 @@ def main() -> None:
     cfg_path = run_dir / "config.json"
     cfg = Config.load(cfg_path) if cfg_path.exists() else Config(data_root=args.data_root)
     cfg.data_root = args.data_root
+    if args.dataset is not None:
+        cfg.dataset = args.dataset
     cfg.batch_size = args.batch_size
     cfg.num_workers = args.num_workers
     cfg.device = args.device
@@ -152,7 +155,7 @@ def main() -> None:
 
     vocab = Vocabulary.from_dict(load_json(run_dir / "vocab.json"))
     concepts = load_json(run_dir / "concepts.json")["concepts"]
-    dataset = DeepEyeNetDataset(cfg.data_root, args.split, vocab, concepts, cfg.image_size, cfg.max_report_len)
+    dataset = MedicalReportDataset(cfg.data_root, args.split, vocab, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
     loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=functools.partial(collate_fn, pad_id=vocab.pad_id))
 
     model = DynamicGraphCaptioner(

@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .config import Config
-from .data import DeepEyeNetDataset, build_artifacts, collate_fn
+from .data import MedicalReportDataset, build_artifacts, collate_fn
 from .model import DynamicGraphCaptioner, compute_losses
 from .utils import ensure_dir, get_device, save_json, set_seed
 
@@ -17,6 +17,7 @@ from .utils import ensure_dir, get_device, save_json, set_seed
 def parse_args() -> Config:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", required=True)
+    parser.add_argument("--dataset", choices=["deepeyenet", "iuxray"], default="deepeyenet")
     parser.add_argument("--output-dir", default="outputs/deepeyenet_dynamic_graph")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -29,6 +30,7 @@ def parse_args() -> Config:
     args = parser.parse_args()
     cfg = Config(
         data_root=args.data_root,
+        dataset=args.dataset,
         output_dir=args.output_dir,
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -81,13 +83,13 @@ def main() -> None:
     set_seed(cfg.seed)
     out_dir = ensure_dir(cfg.output_dir)
     device = get_device(cfg.device)
-    vocab, concepts = build_artifacts(cfg.data_root, cfg.min_token_freq, cfg.max_vocab_size, cfg.max_concepts)
+    vocab, concepts = build_artifacts(cfg.data_root, cfg.min_token_freq, cfg.max_vocab_size, cfg.max_concepts, dataset=cfg.dataset, seed=cfg.seed)
     save_json(vocab.to_dict(), out_dir / "vocab.json")
     save_json({"concepts": concepts}, out_dir / "concepts.json")
     cfg.save(out_dir / "config.json")
 
-    train_ds = DeepEyeNetDataset(cfg.data_root, "train", vocab, concepts, cfg.image_size, cfg.max_report_len)
-    valid_ds = DeepEyeNetDataset(cfg.data_root, "valid", vocab, concepts, cfg.image_size, cfg.max_report_len)
+    train_ds = MedicalReportDataset(cfg.data_root, "train", vocab, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
+    valid_ds = MedicalReportDataset(cfg.data_root, "valid", vocab, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
     collate = functools.partial(collate_fn, pad_id=vocab.pad_id)
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, collate_fn=collate)
     valid_loader = DataLoader(valid_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=collate)

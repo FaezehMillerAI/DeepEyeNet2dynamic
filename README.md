@@ -47,9 +47,12 @@ The JSON files should map image paths to:
 
 ## Quick Start
 
+DeepEyeNet:
+
 ```bash
 pip install -r requirements.txt
 python -m deepeyenet_dynamic_graph.train \
+  --dataset deepeyenet \
   --data-root /path/to/DeepEyeNet \
   --output-dir outputs/run1 \
   --epochs 10 \
@@ -57,9 +60,37 @@ python -m deepeyenet_dynamic_graph.train \
   --num-workers 0
 
 python -m deepeyenet_dynamic_graph.evaluate \
+  --dataset deepeyenet \
   --data-root /path/to/DeepEyeNet \
   --checkpoint outputs/run1/best_model.pt \
   --output-dir outputs/run1/eval \
+  --num-workers 0
+```
+
+IU-XRay from Kaggle:
+
+```bash
+pip install -r requirements.txt
+python -m deepeyenet_dynamic_graph.prepare_iuxray --output-dir outputs/iuxray_prepare
+```
+
+The script prints the Kaggle dataset path. Use that path as `--data-root`:
+
+```bash
+python -m deepeyenet_dynamic_graph.train \
+  --dataset iuxray \
+  --data-root /path/printed/by/prepare_iuxray \
+  --output-dir outputs/iuxray_run1 \
+  --epochs 10 \
+  --batch-size 8 \
+  --num-workers 0
+
+python -m deepeyenet_dynamic_graph.evaluate \
+  --dataset iuxray \
+  --data-root /path/printed/by/prepare_iuxray \
+  --checkpoint outputs/iuxray_run1/best_model.pt \
+  --output-dir outputs/iuxray_run1/eval \
+  --split test \
   --num-workers 0
 ```
 
