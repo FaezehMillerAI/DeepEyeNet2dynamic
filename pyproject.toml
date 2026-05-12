@@ -1,0 +1,9 @@
+[project]
+name = "deepeyenet-dynamic-graph"
+version = "0.1.0"
+description = "Anatomy-aware dynamic explanation graphs for medical image report generation."
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["deepeyenet_dynamic_graph*"]

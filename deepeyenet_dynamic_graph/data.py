@@ -352,12 +352,21 @@ def load_split_records(data_root: str | Path, split: str, dataset: str = "deepey
 
 
 def infer_concepts_from_reports(records: list[dict[str, Any]], max_concepts: int) -> list[str]:
+    stopwords = {
+        "there", "with", "without", "findings", "impression", "comparison", "indication",
+        "normal", "image", "images", "view", "views", "year", "old", "patient", "female",
+        "male", "right", "left", "chest", "lung", "lungs", "heart", "size", "clear",
+        "mild", "moderate", "severe", "seen", "noted", "stable", "acute", "again",
+        "exam", "portable", "frontal", "lateral", "study", "film", "evidence",
+        "large", "small", "lower", "upper", "bilateral", "single", "present", "absent",
+        "unchanged", "interval", "prior", "grossly", "within", "limits", "disease",
+    }
     counter: Counter[str] = Counter()
     for record in records:
         counter.update(record["keywords"])
         text = str(record.get("report_text", "")).lower()
         for token in re.findall(r"[a-z][a-z-]{3,}", text):
-            if token not in {"there", "with", "without", "findings", "impression", "comparison", "indication"}:
+            if token not in stopwords:
                 counter[token] += 1
     return [term for term, _ in counter.most_common(max_concepts)]
 
@@ -384,7 +393,6 @@ def make_transforms(image_size: int, train: bool) -> Callable:
         aug.extend(
             [
                 transforms.RandomResizedCrop(image_size, scale=(0.75, 1.0)),
-                transforms.RandomHorizontalFlip(p=0.5),
                 transforms.ColorJitter(brightness=0.08, contrast=0.08, saturation=0.05),
             ]
         )
@@ -487,6 +495,9 @@ class HFMedicalReportDataset(Dataset):
             add_special_tokens=True,
         )
         input_ids = encoded["input_ids"]
+        if self.tokenizer.bos_token_id is not None and (not input_ids or input_ids[0] != self.tokenizer.bos_token_id):
+            input_ids = [self.tokenizer.bos_token_id] + input_ids
+            input_ids = input_ids[: self.max_report_len]
         if self.tokenizer.eos_token_id is not None and (not input_ids or input_ids[-1] != self.tokenizer.eos_token_id):
             input_ids = input_ids[: self.max_report_len - 1] + [self.tokenizer.eos_token_id]
         concept_targets = torch.zeros(len(self.concepts), dtype=torch.float32)

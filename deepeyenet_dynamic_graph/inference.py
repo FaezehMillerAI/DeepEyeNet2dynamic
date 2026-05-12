@@ -27,7 +27,7 @@ def main() -> None:
     args = parse_args()
     run_dir = Path(args.checkpoint).parent
     cfg = Config.load(run_dir / "config.json")
-    if not (run_dir / "tokenizer.json").exists() and (run_dir / "vocab.json").exists():
+    if not (run_dir / "tokenizer_config.json").exists() and not (run_dir / "tokenizer.json").exists() and (run_dir / "vocab.json").exists():
         cfg.decoder_type = "gru"
     cfg.device = args.device
     concepts = load_json(run_dir / "concepts.json")["concepts"]
@@ -35,7 +35,8 @@ def main() -> None:
     if cfg.decoder_type == "llm":
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(cfg.llm_name)
+        tokenizer_source = run_dir if (run_dir / "tokenizer_config.json").exists() else cfg.llm_name
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         bos_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id

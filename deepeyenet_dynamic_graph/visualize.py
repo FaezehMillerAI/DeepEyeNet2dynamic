@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import tempfile
 import json
-import html
 from pathlib import Path
 from typing import Sequence
 
@@ -30,7 +29,10 @@ def plot_metric_bars(metrics: dict[str, float], output_path: str | Path) -> None
     ax = sns.barplot(x=list(labels), y=list(values), hue=list(labels), palette="viridis", legend=False)
     ax.set_ylabel("Score")
     ax.set_xlabel("")
-    ax.set_ylim(0, max(1.0, max(values) * 1.15 if values else 1.0))
+    if values:
+        ymin = min(0.0, min(values) * 1.15)
+        ymax = max(1.0, max(values) * 1.15)
+        ax.set_ylim(ymin, ymax)
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)

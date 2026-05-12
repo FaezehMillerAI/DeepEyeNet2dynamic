@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -181,6 +182,8 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
     plot_counterfactual_curve(patch_drops, output_dir / "counterfactual_evidence_drop.png")
 
     interactive_examples = []
+    interactive_image_dir = output_dir / "interactive_images"
+    interactive_image_dir.mkdir(parents=True, exist_ok=True)
     anatomy_names = getattr(model, "anatomy_names", [])
     for idx, ex in enumerate(examples):
         concept_scores = ex["concept_prob"]
@@ -191,6 +194,10 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
             plot_evidence_heatmap(full_image_path, region_scores, cfg.patch_grid, output_dir / f"example_{idx}_evidence_heatmap.png")
         plot_dynamic_graph(region_scores, concept_scores, concepts, output_dir / f"example_{idx}_dynamic_graph.png")
         if idx < cfg.max_interactive_examples and full_image_path.exists():
+            image_copy_name = f"case_{idx}{full_image_path.suffix.lower() or '.png'}"
+            image_copy_path = interactive_image_dir / image_copy_name
+            if not image_copy_path.exists():
+                shutil.copy2(full_image_path, image_copy_path)
             rc_mean = ex["rc_edges"].mean(axis=0)
             patches = []
             for patch_id in range(cfg.patch_grid * cfg.patch_grid):
@@ -213,7 +220,7 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
             interactive_examples.append(
                 {
                     "image_path": ex["image_path"],
-                    "image_src": str(full_image_path),
+                    "image_src": f"interactive_images/{image_copy_name}",
                     "patch_grid": cfg.patch_grid,
                     "reference": ex["reference"],
                     "prediction": ex["prediction"],
@@ -233,7 +240,7 @@ def main() -> None:
     run_dir = checkpoint_path.parent
     cfg_path = run_dir / "config.json"
     cfg = Config.load(cfg_path) if cfg_path.exists() else Config(data_root=args.data_root)
-    if not (run_dir / "tokenizer.json").exists() and (run_dir / "vocab.json").exists():
+    if not (run_dir / "tokenizer_config.json").exists() and not (run_dir / "tokenizer.json").exists() and (run_dir / "vocab.json").exists():
         cfg.decoder_type = "gru"
     cfg.data_root = args.data_root
     if args.dataset is not None:
@@ -254,7 +261,8 @@ def main() -> None:
     if cfg.decoder_type == "llm":
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(cfg.llm_name)
+        tokenizer_source = run_dir if (run_dir / "tokenizer_config.json").exists() else cfg.llm_name
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         dataset = HFMedicalReportDataset(cfg.data_root, args.split, tokenizer, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)

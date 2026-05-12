@@ -14,6 +14,9 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    if getattr(torch.backends, "cudnn", None) is not None:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def get_device(name: str = "auto") -> torch.device:

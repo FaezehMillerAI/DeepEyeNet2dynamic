@@ -39,6 +39,10 @@ class Vocabulary:
         return self.stoi[self.unk_token]
 
     def encode(self, text: str, max_len: int) -> list[int]:
+        if max_len <= 0:
+            return []
+        if max_len == 1:
+            return [self.eos_id]
         ids = [self.bos_id]
         ids.extend(self.stoi.get(tok, self.unk_id) for tok in tokenize(text))
         ids.append(self.eos_id)

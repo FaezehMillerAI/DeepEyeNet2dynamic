@@ -41,14 +41,15 @@ class RegionEncoder(nn.Module):
         self.proj = nn.Sequential(nn.Flatten(2), nn.Dropout(dropout))
         self.linear = nn.Linear(64, embed_dim)
         self.pos_embed = nn.Parameter(torch.randn(self.num_regions, embed_dim) * 0.02)
-        self.anatomy_embed = nn.Embedding(4, embed_dim)
+        self.quadrant_embed = nn.Embedding(4, embed_dim)
+        nn.init.normal_(self.quadrant_embed.weight, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.cnn(x)
         feat = self.proj(feat).transpose(1, 2)
         feat = self.linear(feat)
         anatomy_ids = self._anatomy_ids(x.device)
-        return feat + self.pos_embed.unsqueeze(0) + self.anatomy_embed(anatomy_ids).unsqueeze(0)
+        return feat + self.pos_embed.unsqueeze(0) + self.quadrant_embed(anatomy_ids).unsqueeze(0)
 
     def _anatomy_ids(self, device: torch.device) -> torch.Tensor:
         ids = []
@@ -114,11 +115,11 @@ class DynamicGraphCaptioner(nn.Module):
         scores = torch.matmul(r, c.transpose(1, 2)) / (r.shape[-1] ** 0.5)
         return F.softmax(scores, dim=-1)
 
-    def compute_region_anatomy_edges(self, region_features: torch.Tensor) -> torch.Tensor:
+    def compute_region_anatomy_edges(self, region_features: torch.Tensor, anatomy_features: torch.Tensor | None = None) -> torch.Tensor | None:
         if not self.use_anatomy:
-            batch = region_features.shape[0]
-            return torch.zeros(batch, region_features.shape[1], max(1, self.num_anatomy), device=region_features.device)
-        anatomy_features = self.anatomy_embed[: self.num_anatomy].unsqueeze(0).expand(region_features.shape[0], -1, -1)
+            return None
+        if anatomy_features is None:
+            anatomy_features = self.anatomy_embed[: self.num_anatomy].unsqueeze(0).expand(region_features.shape[0], -1, -1)
         scores = torch.matmul(self.region_proj(region_features), self.anatomy_proj(anatomy_features).transpose(1, 2))
         scores = scores / (region_features.shape[-1] ** 0.5)
         prior = self.region_anatomy_prior[:, : self.num_anatomy].to(region_features.device).clamp_min(1e-8).log().unsqueeze(0)
@@ -129,6 +130,19 @@ class DynamicGraphCaptioner(nn.Module):
         scores = scores / (anatomy_features.shape[-1] ** 0.5)
         return F.softmax(scores, dim=-1)
 
+    def compute_region_concept_edges_from_query(
+        self, region_features: torch.Tensor, concept_features: torch.Tensor, query: torch.Tensor
+    ) -> torch.Tensor:
+        r = self.region_proj(region_features)
+        c = self.concept_proj(concept_features) + query.unsqueeze(1)
+        scores = torch.matmul(r, c.transpose(1, 2)) / (r.shape[-1] ** 0.5)
+        return F.softmax(scores, dim=-1)
+
+    def compute_token_concept_edges_from_query(self, concept_features: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+        scores = torch.matmul(self.concept_proj(concept_features), query.unsqueeze(-1)).squeeze(-1)
+        probs = torch.sigmoid(scores)
+        return probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
     def build_graph_features(
         self,
         region_features: torch.Tensor,
@@ -137,29 +151,48 @@ class DynamicGraphCaptioner(nn.Module):
         suppress_concept_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
         if self.use_anatomy:
-            ra_edges = self.compute_region_anatomy_edges(region_features)
             anatomy_features = self.anatomy_embed[: self.num_anatomy].unsqueeze(0).expand(region_features.shape[0], -1, -1)
-            anatomy_msg = torch.matmul(ra_edges.transpose(1, 2), region_features) / max(1, region_features.shape[1])
-            anatomy_features = F.gelu(anatomy_features + self.graph_msg(anatomy_msg))
-            if suppress_anatomy_ids is not None:
-                anatomy_features = anatomy_features.clone()
-                for b, anatomy_id in enumerate(suppress_anatomy_ids.tolist()):
-                    anatomy_features[b, int(anatomy_id)] = 0.0
-            ac_edges = self.compute_anatomy_concept_edges(anatomy_features, concept_features)
-            concept_msg = torch.matmul(ac_edges.transpose(1, 2), anatomy_features) / max(1, self.num_anatomy)
-            rc_edges = torch.matmul(ra_edges, ac_edges)
+            ra_edges = None
+            ac_edges = None
+            rc_edges = None
+            steps = max(1, self.graph_steps)
+            for _ in range(steps):
+                ra_edges = self.compute_region_anatomy_edges(region_features, anatomy_features)
+                assert ra_edges is not None
+                anatomy_msg = torch.matmul(ra_edges.transpose(1, 2), region_features) / max(1, region_features.shape[1])
+                anatomy_features = F.gelu(anatomy_features + self.graph_msg(anatomy_msg))
+                if suppress_anatomy_ids is not None:
+                    anatomy_features = anatomy_features.clone()
+                    for b, anatomy_id in enumerate(suppress_anatomy_ids.tolist()):
+                        anatomy_features[b, int(anatomy_id)] = 0.0
+                ra_edges = self.compute_region_anatomy_edges(region_features, anatomy_features)
+                assert ra_edges is not None
+                ac_edges = self.compute_anatomy_concept_edges(anatomy_features, concept_features)
+                concept_msg = torch.matmul(ac_edges.transpose(1, 2), anatomy_features) / max(1, self.num_anatomy)
+                concept_features = F.gelu(concept_features + self.graph_msg(concept_msg))
+                rc_edges = torch.matmul(ra_edges, ac_edges)
         else:
             ra_edges = None
             ac_edges = None
             anatomy_features = None
-            rc_edges = self.compute_region_concept_edges(region_features, concept_features)
-            concept_msg = torch.matmul(rc_edges.transpose(1, 2), region_features) / max(1, region_features.shape[1])
-        for _ in range(self.graph_steps):
-            concept_features = F.gelu(concept_features + self.graph_msg(concept_msg))
+            rc_edges = None
+            steps = max(1, self.graph_steps)
+            for _ in range(steps):
+                rc_edges = self.compute_region_concept_edges(region_features, concept_features)
+                concept_msg = torch.matmul(rc_edges.transpose(1, 2), region_features) / max(1, region_features.shape[1])
+                concept_features = F.gelu(concept_features + self.graph_msg(concept_msg))
         if suppress_concept_ids is not None:
             concept_features = concept_features.clone()
             for b, concept_id in enumerate(suppress_concept_ids.tolist()):
                 concept_features[b, int(concept_id)] = 0.0
+        if self.use_anatomy and anatomy_features is not None:
+            ra_edges = self.compute_region_anatomy_edges(region_features, anatomy_features)
+            assert ra_edges is not None
+            ac_edges = self.compute_anatomy_concept_edges(anatomy_features, concept_features)
+            rc_edges = torch.matmul(ra_edges, ac_edges)
+        else:
+            rc_edges = self.compute_region_concept_edges(region_features, concept_features)
+        assert rc_edges is not None
         return concept_features, ra_edges, ac_edges, anatomy_features, rc_edges
 
     def forward(
@@ -258,13 +291,14 @@ def compute_losses(
         lm_targets = target_tokens[:, 1 : output.logits.shape[1] + 1]
         rep_loss = F.cross_entropy(output.logits.reshape(-1, output.logits.shape[-1]), lm_targets.reshape(-1), ignore_index=pad_id)
     concept_loss = F.binary_cross_entropy_with_logits(output.concept_logits, concept_targets)
-    concept_probs = torch.sigmoid(output.concept_logits)
-    align_loss = F.binary_cross_entropy(concept_probs.clamp(1e-4, 1 - 1e-4), concept_targets)
+    graph_readout = output.token_concept_edges.max(dim=1).values.clamp(1e-4, 1 - 1e-4)
+    align_loss = F.binary_cross_entropy(graph_readout, concept_targets)
     edge_probs = output.token_concept_edges.clamp_min(1e-8)
     sparse_loss = -(edge_probs * edge_probs.log()).sum(dim=-1).mean()
     temp_loss = torch.tensor(0.0, device=target_tokens.device)
-    if output.rc_edges.shape[1] > 1:
-        temp_loss = (output.rc_edges[:, 1:] - output.rc_edges[:, :-1]).abs().mean()
+    if output.rc_edges.shape[1] > 2:
+        first_diff = output.rc_edges[:, 1:] - output.rc_edges[:, :-1]
+        temp_loss = (first_diff[:, 1:] - first_diff[:, :-1]).abs().mean()
     total = rep_loss + lambda_concept * concept_loss + lambda_align * align_loss + lambda_sparse * sparse_loss + lambda_temp * temp_loss
     return total, {
         "loss": float(total.detach().cpu()),
@@ -325,6 +359,7 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
             nn.GELU(),
             nn.Linear(hidden_dim, self.llm_dim),
         )
+        self.llm_state_to_graph = nn.Linear(self.llm_dim, embed_dim)
         if freeze_llm:
             for param in self.llm.parameters():
                 param.requires_grad = False
@@ -365,6 +400,21 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         prefix = self._graph_prefix(region_features, concept_features, anatomy_features, rc_edges)
         return prefix, region_features, ra_edges, ac_edges, anatomy_features, concept_features
 
+    def _dynamic_edges_from_llm_hidden(
+        self,
+        llm_hidden: torch.Tensor,
+        region_features: torch.Tensor,
+        concept_features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rc_edges = []
+        token_concept_edges = []
+        graph_queries = self.llm_state_to_graph(llm_hidden)
+        for t in range(graph_queries.shape[1]):
+            query = graph_queries[:, t]
+            rc_edges.append(self.compute_region_concept_edges_from_query(region_features, concept_features, query))
+            token_concept_edges.append(self.compute_token_concept_edges_from_query(concept_features, query))
+        return torch.stack(rc_edges, dim=1), torch.stack(token_concept_edges, dim=1)
+
     def forward(
         self,
         images: torch.Tensor,
@@ -386,13 +436,11 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         labels[attention_mask == 0] = -100
         prefix_labels = torch.full((tokens.shape[0], self.prefix_length), -100, dtype=torch.long, device=tokens.device)
         labels = torch.cat([prefix_labels, labels], dim=1)
-        lm_out = self.llm(inputs_embeds=inputs_embeds, attention_mask=full_mask, labels=labels)
+        lm_out = self.llm(inputs_embeds=inputs_embeds, attention_mask=full_mask, labels=labels, output_hidden_states=True, return_dict=True)
         concept_logits = self.concept_head(concept_features).squeeze(-1)
-        rc_edges = torch.matmul(ra_edges, ac_edges) if ra_edges is not None and ac_edges is not None else self.compute_region_concept_edges(region_features, concept_features)
         steps = max(1, tokens.shape[1] - 1)
-        rc_seq = rc_edges.unsqueeze(1).expand(-1, steps, -1, -1)
-        concept_probs = torch.softmax(concept_logits, dim=-1)
-        token_concept = concept_probs.unsqueeze(1).expand(-1, steps, -1)
+        token_hidden = lm_out.hidden_states[-1][:, self.prefix_length : self.prefix_length + steps]
+        rc_seq, token_concept = self._dynamic_edges_from_llm_hidden(token_hidden, region_features, concept_features)
         logits = lm_out.logits[:, self.prefix_length :, :]
         return DecodeOutput(logits, concept_logits, rc_seq, token_concept, region_features, concept_features, ra_edges, ac_edges, anatomy_features, lm_out.loss)
 
@@ -408,7 +456,7 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
             text_embeds = self.llm.get_input_embeddings()(generated)
             inputs_embeds = torch.cat([prefix, text_embeds], dim=1)
             mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=images.device)
-            out = self.llm(inputs_embeds=inputs_embeds, attention_mask=mask)
+            out = self.llm(inputs_embeds=inputs_embeds, attention_mask=mask, output_hidden_states=True, return_dict=True)
             next_logits = out.logits[:, -1, :]
             next_id = next_logits.argmax(dim=-1)
             next_id = torch.where(finished, torch.full_like(next_id, self.pad_id), next_id)
@@ -420,9 +468,15 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
                 break
         gen_tokens = generated[:, 1:]
         concept_logits = self.concept_head(concept_features).squeeze(-1)
-        rc_edges = torch.matmul(ra_edges, ac_edges) if ra_edges is not None and ac_edges is not None else self.compute_region_concept_edges(region_features, concept_features)
-        steps = max(1, gen_tokens.shape[1])
-        rc_seq = rc_edges.unsqueeze(1).expand(-1, steps, -1, -1)
-        token_concept = torch.softmax(concept_logits, dim=-1).unsqueeze(1).expand(-1, steps, -1)
+        if gen_tokens.shape[1] > 0:
+            text_embeds = self.llm.get_input_embeddings()(generated[:, :-1])
+            inputs_embeds = torch.cat([prefix, text_embeds], dim=1)
+            mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=images.device)
+            hidden_out = self.llm(inputs_embeds=inputs_embeds, attention_mask=mask, output_hidden_states=True, return_dict=True)
+            token_hidden = hidden_out.hidden_states[-1][:, self.prefix_length :]
+            rc_seq, token_concept = self._dynamic_edges_from_llm_hidden(token_hidden, region_features, concept_features)
+        else:
+            rc_seq = torch.empty(batch, 0, region_features.shape[1], self.num_concepts, device=images.device)
+            token_concept = torch.empty(batch, 0, self.num_concepts, device=images.device)
         logits = torch.stack(logits_steps, dim=1) if logits_steps else torch.empty(batch, 0, self.llm.config.vocab_size, device=images.device)
         return DecodeOutput(logits, concept_logits, rc_seq, token_concept, region_features, concept_features, ra_edges, ac_edges, anatomy_features), gen_tokens

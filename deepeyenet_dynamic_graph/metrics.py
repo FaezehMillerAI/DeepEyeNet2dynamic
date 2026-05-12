@@ -10,6 +10,8 @@ from .vocab import tokenize
 
 def language_metrics(references: Sequence[str], hypotheses: Sequence[str]) -> dict[str, float]:
     scores: dict[str, float] = {}
+    references = [str(r) if str(r).strip() else "empty report" for r in references]
+    hypotheses = [str(h) if str(h).strip() else "empty report" for h in hypotheses]
     try:
         from nltk.translate.bleu_score import SmoothingFunction, corpus_bleu
 
@@ -33,11 +35,21 @@ def language_metrics(references: Sequence[str], hypotheses: Sequence[str]) -> di
         scores["rouge_l"] = float("nan")
 
     try:
+        import nltk
+        nltk.data.find("corpora/wordnet")
+        nltk.data.find("corpora/omw-1.4")
         from nltk.translate.meteor_score import meteor_score
 
         scores["meteor"] = float(np.mean([meteor_score([tokenize(r)], tokenize(h)) for r, h in zip(references, hypotheses)]))
     except Exception:
         scores["meteor"] = float("nan")
+    try:
+        from bert_score import score as bert_score
+
+        _, _, f1 = bert_score(list(hypotheses), list(references), lang="en", verbose=False, rescale_with_baseline=False)
+        scores["bertscore_f1"] = float(f1.mean().item())
+    except Exception:
+        scores["bertscore_f1"] = float("nan")
     return scores
 
 
@@ -74,16 +86,23 @@ def graph_metrics(
         temp_drift = float(np.abs(rc_edges[:, 1:] - rc_edges[:, :-1]).mean())
 
     top_hits = []
+    precision_hits = []
+    recall_hits = []
     mean_token_concept = token_concept_edges.mean(axis=1) if token_concept_edges.ndim == 3 else token_concept_edges
     for probs, truth in zip(mean_token_concept, y_true):
         true_ids = set(np.where(truth > 0)[0].tolist())
         if not true_ids:
             continue
         pred_ids = set(np.argsort(-probs)[:topk].tolist())
-        top_hits.append(len(true_ids & pred_ids) / min(len(true_ids), topk))
+        overlap = len(true_ids & pred_ids)
+        top_hits.append(overlap / min(len(true_ids), topk))
+        precision_hits.append(overlap / max(1, topk))
+        recall_hits.append(overlap / max(1, len(true_ids)))
     return {
         "token_concept_entropy": edge_entropy,
         "region_concept_entropy": rc_entropy,
         "temporal_graph_drift": temp_drift,
         f"top{topk}_concept_hit_rate": float(np.mean(top_hits)) if top_hits else 0.0,
+        f"top{topk}_concept_precision": float(np.mean(precision_hits)) if precision_hits else 0.0,
+        f"top{topk}_concept_recall": float(np.mean(recall_hits)) if recall_hits else 0.0,
     }

@@ -37,6 +37,7 @@ def parse_args() -> Config:
     parser.add_argument("--lambda-sparse", type=float, default=0.01)
     parser.add_argument("--lambda-temp", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--no-anatomy", action="store_true")
     parser.add_argument("--disable-counterfactuals", action="store_true")
     parser.add_argument("--device", default="auto")
@@ -62,6 +63,7 @@ def parse_args() -> Config:
         lambda_sparse=args.lambda_sparse,
         lambda_temp=args.lambda_temp,
         num_workers=args.num_workers,
+        grad_clip=args.grad_clip,
         use_anatomy=not args.no_anatomy,
         disable_counterfactuals=args.disable_counterfactuals,
         device=args.device,
@@ -120,13 +122,14 @@ def main() -> None:
         tokenizer = AutoTokenizer.from_pretrained(cfg.llm_name)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.save_pretrained(out_dir)
         train_records = load_split_records(cfg.data_root, "train", dataset=cfg.dataset, seed=cfg.seed)
         concepts = build_concepts((r["keywords"] for r in train_records), max_concepts=cfg.max_concepts)
         if not concepts:
             from .data import infer_concepts_from_reports
 
             concepts = infer_concepts_from_reports(train_records, max_concepts=cfg.max_concepts)
-        save_json({"llm_name": cfg.llm_name, "pad_token": tokenizer.pad_token}, out_dir / "tokenizer.json")
+        save_json({"llm_name": cfg.llm_name, "pad_token": tokenizer.pad_token, "source": "save_pretrained"}, out_dir / "tokenizer_meta.json")
         vocab = None
     else:
         vocab, concepts = build_artifacts(cfg.data_root, cfg.min_token_freq, cfg.max_vocab_size, cfg.max_concepts, dataset=cfg.dataset, seed=cfg.seed)

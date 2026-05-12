@@ -109,6 +109,8 @@ The default model is now LLM-based. The explanation graph is converted into lear
 image patch -> anatomy node -> finding node -> LLM soft prefix -> generated report
 ```
 
+During training and evaluation, the LLM hidden state at each token position recomputes the region-concept and token-concept edges. This keeps the explanation graph dynamic rather than broadcasting one static graph across the whole report.
+
 Default lightweight Colab setting:
 
 ```bash
