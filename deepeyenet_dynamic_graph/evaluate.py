@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import functools
 import shutil
+import re
 from pathlib import Path
 
 import numpy as np
@@ -78,6 +79,21 @@ def _decode_text(decoder, ids: list[int]) -> str:
     if hasattr(decoder, "itos"):
         return decoder.decode(ids)
     return decoder.decode(ids, skip_special_tokens=True)
+
+
+def _split_sentences(text: str) -> list[str]:
+    parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", str(text).strip()) if s.strip()]
+    return parts or [str(text).strip() or "empty generated report"]
+
+
+def _linked_sentence_id(sentences: list[str], concept_names: list[str]) -> int:
+    lowered = [s.lower() for s in sentences]
+    for concept in concept_names:
+        concept_l = concept.lower()
+        for idx, sent in enumerate(lowered):
+            if concept_l and concept_l in sent:
+                return idx
+    return 0
 
 
 @torch.no_grad()
@@ -199,9 +215,14 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
             if not image_copy_path.exists():
                 shutil.copy2(full_image_path, image_copy_path)
             rc_mean = ex["rc_edges"].mean(axis=0)
+            report_sentences = _split_sentences(ex["prediction"])
+            region_strength = region_scores - region_scores.min()
+            region_strength = region_strength / (region_strength.max() + 1e-8)
             patches = []
             for patch_id in range(cfg.patch_grid * cfg.patch_grid):
                 top_concepts = np.argsort(-rc_mean[patch_id])[: min(3, len(concepts))]
+                top_concept_names = [concepts[int(c)] for c in top_concepts]
+                linked_sid = _linked_sentence_id(report_sentences, top_concept_names)
                 anatomy = "region"
                 if ex["region_anatomy_edges"] is not None and anatomy_names:
                     anatomy_id = int(np.argmax(ex["region_anatomy_edges"][patch_id]))
@@ -211,7 +232,9 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
                         "patch_id": patch_id,
                         "anatomy": anatomy,
                         "top_concepts": [{"name": concepts[int(c)], "score": float(rc_mean[patch_id, int(c)])} for c in top_concepts],
-                        "linked_report_text": ex["prediction"],
+                        "evidence_score": float(region_strength[patch_id]),
+                        "linked_sentence_id": int(linked_sid),
+                        "linked_report_text": report_sentences[linked_sid],
                         "patch_counterfactual_drop": ex["patch_cf_drop"] if patch_id == int(np.argmax(region_scores)) else 0.0,
                         "anatomy_counterfactual_drop": ex["anatomy_cf_drop"] if patch_id == int(np.argmax(region_scores)) else 0.0,
                         "finding_counterfactual_drop": ex["finding_cf_drop"] if patch_id == int(np.argmax(region_scores)) else 0.0,
@@ -224,6 +247,7 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
                     "patch_grid": cfg.patch_grid,
                     "reference": ex["reference"],
                     "prediction": ex["prediction"],
+                    "report_sentences": report_sentences,
                     "keywords": ex["keywords"],
                     "patches": patches,
                 }

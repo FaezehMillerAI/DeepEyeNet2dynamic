@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import tempfile
 import json
+import base64
+import mimetypes
 from pathlib import Path
 from typing import Sequence
 
@@ -125,6 +127,13 @@ def plot_counterfactual_curve(drops: Sequence[float], output_path: str | Path) -
 def write_interactive_explanations(examples: list[dict], output_path: str | Path) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    for ex in examples:
+        image_src = ex.get("image_src", "")
+        image_path = output_path.parent / image_src
+        if image_path.exists():
+            mime = mimetypes.guess_type(image_path.name)[0] or "image/png"
+            encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+            ex["image_src"] = f"data:{mime};base64,{encoded}"
     payload = json.dumps(examples)
     page = f"""<!doctype html>
 <html>
@@ -138,6 +147,10 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; 
 .image-wrap img {{ width: 100%; display: block; border-radius: 6px; }}
 .patch {{ position: absolute; border: 1px solid rgba(255,255,255,.42); background: rgba(42,157,143,.08); cursor: crosshair; }}
 .patch:hover {{ background: rgba(244,162,97,.28); outline: 2px solid #f4a261; z-index: 2; }}
+.sentence {{ border-radius: 4px; padding: 1px 3px; transition: background .12s ease, box-shadow .12s ease; }}
+.sentence.active {{ background: #fff1bf; box-shadow: inset 0 -2px 0 #f4a261; }}
+.scorebar {{ height: 6px; background: #e5e7eb; border-radius: 999px; overflow: hidden; margin: 5px 0 8px; }}
+.scorebar > span {{ display: block; height: 100%; background: #2a9d8f; }}
 .tooltip {{ position: fixed; display: none; max-width: 360px; padding: 12px; background: #111827; color: white; border-radius: 6px; font-size: 13px; line-height: 1.35; pointer-events: none; z-index: 99; box-shadow: 0 12px 28px rgba(0,0,0,.28); }}
 .report {{ white-space: pre-wrap; line-height: 1.5; }}
 .meta {{ color: #52606d; font-size: 13px; }}
@@ -160,6 +173,7 @@ function patchTip(p) {{
   const concepts = p.top_concepts.map(c => `<span class="pill">${{esc(c.name)}} ${{Number(c.score).toFixed(3)}}</span>`).join('');
   return `<b>Patch R${{p.patch_id}}</b><br>
   Anatomy: <b>${{esc(p.anatomy)}}</b><br>
+  Evidence score: ${{Number(p.evidence_score ?? 0).toFixed(3)}}<div class="scorebar"><span style="width:${{Math.max(0, Math.min(100, Number(p.evidence_score ?? 0) * 100))}}%"></span></div>
   Top findings:<br>${{concepts}}<br>
   Linked report: <i>${{esc(p.linked_report_text)}}</i><br>
   Patch CF drop: ${{Number(p.patch_counterfactual_drop ?? 0).toFixed(3)}}<br>
@@ -182,19 +196,29 @@ examples.forEach((ex, idx) => {{
     cell.style.top = `${{100 * row / grid}}%`;
     cell.style.width = `${{100 / grid}}%`;
     cell.style.height = `${{100 / grid}}%`;
+    cell.style.background = `rgba(42,157,143,${{0.05 + 0.28 * Number(p.evidence_score ?? 0)}})`;
     cell.addEventListener('mousemove', ev => {{
+      document.querySelectorAll(`[data-case="${{idx}}"] .sentence`).forEach(s => s.classList.remove('active'));
+      const linked = document.querySelector(`[data-case="${{idx}}"] .sentence[data-sid="${{p.linked_sentence_id ?? 0}}"]`);
+      if (linked) linked.classList.add('active');
       tooltip.style.display = 'block';
       tooltip.style.left = (ev.clientX + 14) + 'px';
       tooltip.style.top = (ev.clientY + 14) + 'px';
       tooltip.innerHTML = patchTip(p);
     }});
-    cell.addEventListener('mouseleave', () => tooltip.style.display = 'none');
+    cell.addEventListener('mouseleave', () => {{
+      tooltip.style.display = 'none';
+      document.querySelectorAll(`[data-case="${{idx}}"] .sentence`).forEach(s => s.classList.remove('active'));
+    }});
     image.appendChild(cell);
   }});
   const text = document.createElement('div');
+  text.setAttribute('data-case', idx);
+  const sentences = (ex.report_sentences && ex.report_sentences.length ? ex.report_sentences : [ex.prediction])
+    .map((s, sid) => `<span class="sentence" data-sid="${{sid}}">${{esc(s)}}</span>`).join(' ');
   text.innerHTML = `<h2>${{esc(ex.image_path)}}</h2>
     <div class="meta">Keywords: ${{ex.keywords.map(esc).join(', ')}}</div>
-    <h3>Generated Report</h3><div class="report">${{esc(ex.prediction)}}</div>
+    <h3>Generated Report</h3><div class="report">${{sentences}}</div>
     <h3>Reference Report</h3><div class="report">${{esc(ex.reference)}}</div>`;
   div.appendChild(image);
   div.appendChild(text);
