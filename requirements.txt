@@ -15,3 +15,4 @@ kagglehub>=0.2.9
 transformers>=4.40.0
 accelerate>=0.29.0
 sacremoses>=0.1.1
+openai>=1.30.0

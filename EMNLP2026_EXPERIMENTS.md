@@ -44,6 +44,8 @@ Clinical fidelity:
 - Concept micro/macro precision, recall, F1
 - Exact concept match
 - IU-XRay: add CheXbert/CheXpert label F1 if available
+- RadGraph entity/relation coverage when RadGraph annotations are provided
+- Concept-normalization ablation: raw keywords vs rule normalization vs LLM-assisted normalization
 
 Explanation quality:
 

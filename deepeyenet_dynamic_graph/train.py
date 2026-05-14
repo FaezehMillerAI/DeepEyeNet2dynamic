@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .config import Config
+from .concept_graph import build_concept_graph
 from .data import HFMedicalReportDataset, MedicalReportDataset, anatomy_prior_matrix, build_artifacts, collate_fn, collate_hf_fn, get_anatomy_names, load_split_records
 from .model import DynamicGraphCaptioner, GraphPrefixLLMCaptioner, compute_losses
 from .utils import ensure_dir, get_device, save_json, set_seed
@@ -27,6 +28,10 @@ def parse_args() -> Config:
     parser.add_argument("--patch-grid", type=int, default=4)
     parser.add_argument("--max-report-len", type=int, default=96)
     parser.add_argument("--max-concepts", type=int, default=128)
+    parser.add_argument("--concept-source", choices=["keywords", "hybrid", "radgraph"], default="hybrid")
+    parser.add_argument("--radgraph-path", default=None)
+    parser.add_argument("--concept-normalizer", choices=["rules", "llm"], default="rules")
+    parser.add_argument("--concept-normalizer-model", default="gpt-4o-mini")
     parser.add_argument("--decoder-type", choices=["llm", "gru"], default="llm")
     parser.add_argument("--llm-name", default="distilgpt2")
     parser.add_argument("--freeze-llm", action="store_true")
@@ -53,6 +58,10 @@ def parse_args() -> Config:
         patch_grid=args.patch_grid,
         max_report_len=args.max_report_len,
         max_concepts=args.max_concepts,
+        concept_source=args.concept_source,
+        radgraph_path=args.radgraph_path,
+        concept_normalizer=args.concept_normalizer,
+        concept_normalizer_model=args.concept_normalizer_model,
         decoder_type=args.decoder_type,
         llm_name=args.llm_name,
         freeze_llm=args.freeze_llm,
@@ -124,25 +133,51 @@ def main() -> None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.save_pretrained(out_dir)
         train_records = load_split_records(cfg.data_root, "train", dataset=cfg.dataset, seed=cfg.seed)
-        concepts = build_concepts((r["keywords"] for r in train_records), max_concepts=cfg.max_concepts)
+        if cfg.concept_source == "keywords":
+            concepts = build_concepts((r["keywords"] for r in train_records), max_concepts=cfg.max_concepts)
+            concept_graph = {"concepts": concepts, "relations": [], "source": "keywords", "normalizer": "none"}
+        else:
+            concept_graph = build_concept_graph(
+                train_records,
+                cfg.max_concepts,
+                radgraph_path=cfg.radgraph_path,
+                normalizer=cfg.concept_normalizer,
+                normalizer_cache=out_dir / "concept_normalization_cache.json",
+                llm_model=cfg.concept_normalizer_model,
+            )
+            concepts = concept_graph["concepts"]
         if not concepts:
             from .data import infer_concepts_from_reports
-
             concepts = infer_concepts_from_reports(train_records, max_concepts=cfg.max_concepts)
+            concept_graph = {"concepts": concepts, "relations": [], "source": "fallback_report_terms", "normalizer": cfg.concept_normalizer}
         save_json({"llm_name": cfg.llm_name, "pad_token": tokenizer.pad_token, "source": "save_pretrained"}, out_dir / "tokenizer_meta.json")
         vocab = None
     else:
         vocab, concepts = build_artifacts(cfg.data_root, cfg.min_token_freq, cfg.max_vocab_size, cfg.max_concepts, dataset=cfg.dataset, seed=cfg.seed)
+        train_records = load_split_records(cfg.data_root, "train", dataset=cfg.dataset, seed=cfg.seed)
+        if cfg.concept_source != "keywords":
+            concept_graph = build_concept_graph(
+                train_records,
+                cfg.max_concepts,
+                radgraph_path=cfg.radgraph_path,
+                normalizer=cfg.concept_normalizer,
+                normalizer_cache=out_dir / "concept_normalization_cache.json",
+                llm_model=cfg.concept_normalizer_model,
+            )
+            concepts = concept_graph["concepts"] or concepts
+        else:
+            concept_graph = {"concepts": concepts, "relations": [], "source": "keywords", "normalizer": "none"}
         save_json(vocab.to_dict(), out_dir / "vocab.json")
     save_json({"concepts": concepts}, out_dir / "concepts.json")
+    save_json(concept_graph, out_dir / "concept_graph.json")
     cfg.save(out_dir / "config.json")
 
     if cfg.decoder_type == "llm":
-        train_ds = HFMedicalReportDataset(cfg.data_root, "train", tokenizer, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
+        train_ds = HFMedicalReportDataset(cfg.data_root, "train", tokenizer, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed, concept_graph.get("per_record_concepts", {}))
         valid_ds = HFMedicalReportDataset(cfg.data_root, "valid", tokenizer, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
         collate = functools.partial(collate_hf_fn, pad_id=tokenizer.pad_token_id)
     else:
-        train_ds = MedicalReportDataset(cfg.data_root, "train", vocab, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
+        train_ds = MedicalReportDataset(cfg.data_root, "train", vocab, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed, concept_graph.get("per_record_concepts", {}))
         valid_ds = MedicalReportDataset(cfg.data_root, "valid", vocab, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
         collate = functools.partial(collate_fn, pad_id=vocab.pad_id)
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, collate_fn=collate)

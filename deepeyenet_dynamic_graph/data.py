@@ -351,6 +351,21 @@ def load_split_records(data_root: str | Path, split: str, dataset: str = "deepey
     raise ValueError(f"Unsupported dataset '{dataset}'. Use 'deepeyenet' or 'iuxray'.")
 
 
+def apply_record_concepts(records: list[dict[str, Any]], per_record_concepts: dict[str, list[str]]) -> list[dict[str, Any]]:
+    if not per_record_concepts:
+        return records
+    updated = []
+    for rec in records:
+        key = str(rec.get("uid", rec.get("image_path", "")))
+        image_key = str(rec.get("image_path", ""))
+        concepts = per_record_concepts.get(key) or per_record_concepts.get(image_key)
+        if concepts:
+            rec = dict(rec)
+            rec["keywords"] = concepts
+        updated.append(rec)
+    return updated
+
+
 def infer_concepts_from_reports(records: list[dict[str, Any]], max_concepts: int) -> list[str]:
     stopwords = {
         "there", "with", "without", "findings", "impression", "comparison", "indication",
@@ -418,11 +433,12 @@ class MedicalReportDataset(Dataset):
         image_size: int = 224,
         max_report_len: int = 96,
         seed: int = 42,
+        per_record_concepts: dict[str, list[str]] | None = None,
     ) -> None:
         self.data_root = Path(data_root)
         self.split = split
         self.dataset = dataset
-        self.records = load_split_records(data_root, split, dataset=dataset, seed=seed)
+        self.records = apply_record_concepts(load_split_records(data_root, split, dataset=dataset, seed=seed), per_record_concepts or {})
         self.vocab = vocab
         self.concepts = concepts
         self.concept_to_idx = {c: i for i, c in enumerate(concepts)}
@@ -469,11 +485,12 @@ class HFMedicalReportDataset(Dataset):
         image_size: int = 224,
         max_report_len: int = 96,
         seed: int = 42,
+        per_record_concepts: dict[str, list[str]] | None = None,
     ) -> None:
         self.data_root = Path(data_root)
         self.split = split
         self.dataset = dataset
-        self.records = load_split_records(data_root, split, dataset=dataset, seed=seed)
+        self.records = apply_record_concepts(load_split_records(data_root, split, dataset=dataset, seed=seed), per_record_concepts or {})
         self.tokenizer = tokenizer
         self.concepts = concepts
         self.concept_to_idx = {c: i for i, c in enumerate(concepts)}

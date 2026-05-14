@@ -111,6 +111,45 @@ image patch -> anatomy node -> finding node -> LLM soft prefix -> generated repo
 
 During training and evaluation, the LLM hidden state at each token position recomputes the region-concept and token-concept edges. This keeps the explanation graph dynamic rather than broadcasting one static graph across the whole report.
 
+## Concept Graphs
+
+The graph concept vocabulary can be built from keywords, RadGraph-style entities, or a hybrid clinical extractor:
+
+```bash
+--concept-source hybrid
+```
+
+If you have RadGraph output JSON, pass:
+
+```bash
+--concept-source radgraph \
+--radgraph-path /path/to/radgraph_outputs.json
+```
+
+To use cached LLM-assisted concept normalization, set `OPENAI_API_KEY` and add:
+
+```bash
+--concept-normalizer llm \
+--concept-normalizer-model gpt-4o-mini
+```
+
+Training writes:
+
+```text
+concept_graph.json
+concept_normalization_cache.json
+```
+
+You can inspect concept extraction separately:
+
+```bash
+python -m deepeyenet_dynamic_graph.prepare_concepts \
+  --dataset iuxray \
+  --data-root /path/to/IU-XRay \
+  --output outputs/iuxray_concept_graph.json \
+  --radgraph-path /path/to/radgraph_outputs.json
+```
+
 Default lightweight Colab setting:
 
 ```bash

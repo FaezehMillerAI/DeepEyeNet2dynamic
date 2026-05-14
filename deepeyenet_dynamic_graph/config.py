@@ -18,6 +18,10 @@ class Config:
     min_token_freq: int = 1
     max_vocab_size: int = 12000
     max_concepts: int = 128
+    concept_source: str = "hybrid"
+    radgraph_path: str | None = None
+    concept_normalizer: str = "rules"
+    concept_normalizer_model: str = "gpt-4o-mini"
     embed_dim: int = 256
     hidden_dim: int = 256
     decoder_type: str = "llm"
