@@ -14,7 +14,7 @@ from tqdm import tqdm
 from .config import Config
 from .data import HFMedicalReportDataset, MedicalReportDataset, anatomy_prior_matrix, collate_fn, collate_hf_fn, get_anatomy_names
 from .metrics import concept_metrics, graph_metrics, language_metrics
-from .model import DynamicGraphCaptioner, GraphPrefixLLMCaptioner
+from .model import DynamicGraphCaptioner, GraphPrefixLLMCaptioner, GraphSeq2SeqCaptioner
 from .utils import ensure_dir, get_device, load_json, save_json
 from .visualize import (
     plot_concept_confusion,
@@ -41,6 +41,55 @@ def parse_args():
     parser.add_argument("--no-counterfactuals", action="store_true")
     parser.add_argument("--max-interactive-examples", type=int, default=None)
     return parser.parse_args()
+
+
+def _uses_hf_decoder(cfg: Config) -> bool:
+    return cfg.decoder_type in {"llm", "causal_lm", "seq2seq"}
+
+
+def _is_seq2seq_decoder(cfg: Config) -> bool:
+    return cfg.decoder_type == "seq2seq"
+
+
+def _prepare_tokenizer(tokenizer):
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.eos_token is None and tokenizer.pad_token is not None:
+        tokenizer.eos_token = tokenizer.pad_token
+    return tokenizer
+
+
+def _token_ids(tokenizer) -> tuple[int, int, int]:
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    bos_id = tokenizer.bos_token_id
+    if bos_id is None:
+        bos_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if bos_id is None:
+        bos_id = pad_id
+    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id
+    return int(pad_id), int(bos_id), int(eos_id)
+
+
+def _build_hf_model(cfg: Config, tokenizer, concepts: list[str]):
+    pad_id, bos_id, eos_id = _token_ids(tokenizer)
+    model_cls = GraphSeq2SeqCaptioner if _is_seq2seq_decoder(cfg) else GraphPrefixLLMCaptioner
+    return model_cls(
+        cfg.llm_name,
+        concepts,
+        pad_id,
+        bos_id,
+        eos_id,
+        cfg.embed_dim,
+        cfg.hidden_dim,
+        cfg.patch_grid,
+        cfg.dropout,
+        cfg.graph_steps,
+        get_anatomy_names(cfg.dataset),
+        anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
+        cfg.use_anatomy,
+        cfg.freeze_llm,
+        cfg.prefix_length,
+    )
 
 
 def _top_region_ids(rc_edges: torch.Tensor, concept_ids: torch.Tensor) -> torch.Tensor:
@@ -282,33 +331,15 @@ def main() -> None:
     device = get_device(cfg.device)
 
     concepts = load_json(run_dir / "concepts.json")["concepts"]
-    if cfg.decoder_type == "llm":
+    if _uses_hf_decoder(cfg):
         from transformers import AutoTokenizer
 
         tokenizer_source = run_dir if (run_dir / "tokenizer_config.json").exists() else cfg.llm_name
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer = _prepare_tokenizer(AutoTokenizer.from_pretrained(tokenizer_source))
         dataset = HFMedicalReportDataset(cfg.data_root, args.split, tokenizer, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
-        loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=functools.partial(collate_hf_fn, pad_id=tokenizer.pad_token_id))
-        bos_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
-        model = GraphPrefixLLMCaptioner(
-            cfg.llm_name,
-            concepts,
-            tokenizer.pad_token_id,
-            bos_id,
-            tokenizer.eos_token_id,
-            cfg.embed_dim,
-            cfg.hidden_dim,
-            cfg.patch_grid,
-            cfg.dropout,
-            cfg.graph_steps,
-            get_anatomy_names(cfg.dataset),
-            anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
-            cfg.use_anatomy,
-            cfg.freeze_llm,
-            cfg.prefix_length,
-        ).to(device)
+        pad_id, _, _ = _token_ids(tokenizer)
+        loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=functools.partial(collate_hf_fn, pad_id=pad_id))
+        model = _build_hf_model(cfg, tokenizer, concepts).to(device)
         text_decoder = tokenizer
     else:
         vocab = Vocabulary.from_dict(load_json(run_dir / "vocab.json"))

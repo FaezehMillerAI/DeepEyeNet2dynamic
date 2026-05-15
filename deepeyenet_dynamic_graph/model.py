@@ -21,6 +21,14 @@ class DecodeOutput:
     lm_loss: torch.Tensor | None = None
 
 
+def _hf_hidden_size(config) -> int:
+    for name in ("hidden_size", "n_embd", "d_model"):
+        value = getattr(config, name, None)
+        if value is not None:
+            return int(value)
+    raise ValueError(f"Could not infer HuggingFace hidden size from {config.__class__.__name__}")
+
+
 class RegionEncoder(nn.Module):
     """Compact patch encoder for retinal region nodes."""
 
@@ -351,7 +359,7 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         )
         self.llm_name = llm_name
         self.llm = AutoModelForCausalLM.from_pretrained(llm_name)
-        self.llm_dim = self.llm.config.hidden_size
+        self.llm_dim = _hf_hidden_size(self.llm.config)
         self.prefix_length = prefix_length
         self.prefix_offset = nn.Parameter(torch.randn(prefix_length, self.llm_dim) * 0.02)
         self.prefix_proj = nn.Sequential(
@@ -480,3 +488,218 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
             token_concept = torch.empty(batch, 0, self.num_concepts, device=images.device)
         logits = torch.stack(logits_steps, dim=1) if logits_steps else torch.empty(batch, 0, self.llm.config.vocab_size, device=images.device)
         return DecodeOutput(logits, concept_logits, rc_seq, token_concept, region_features, concept_features, ra_edges, ac_edges, anatomy_features), gen_tokens
+
+
+class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
+    """Anatomy-aware graph encoder coupled to an encoder-decoder LLM.
+
+    The graph is presented to models such as T5/FLAN-T5 as learned encoder
+    prefix tokens. Decoder hidden states then query the graph at each generated
+    position, so the explanation edges remain token-conditioned.
+    """
+
+    def __init__(
+        self,
+        llm_name: str,
+        concept_names: list[str],
+        pad_id: int,
+        bos_id: int | None,
+        eos_id: int | None,
+        embed_dim: int = 256,
+        hidden_dim: int = 256,
+        patch_grid: int = 4,
+        dropout: float = 0.2,
+        graph_steps: int = 1,
+        anatomy_names: list[str] | None = None,
+        region_anatomy_prior: torch.Tensor | None = None,
+        use_anatomy: bool = True,
+        freeze_llm: bool = False,
+        prefix_length: int = 4,
+    ) -> None:
+        from transformers import AutoModelForSeq2SeqLM
+
+        fallback_id = next((idx for idx in (pad_id, bos_id, eos_id) if idx is not None and idx >= 0), 0)
+        dummy_vocab_size = int(fallback_id) + 8
+        super().__init__(
+            vocab_size=dummy_vocab_size,
+            concept_names=concept_names,
+            pad_id=int(pad_id if pad_id is not None else fallback_id),
+            bos_id=int(bos_id if bos_id is not None else fallback_id),
+            eos_id=int(eos_id if eos_id is not None else fallback_id),
+            embed_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            patch_grid=patch_grid,
+            dropout=dropout,
+            graph_steps=graph_steps,
+            anatomy_names=anatomy_names,
+            region_anatomy_prior=region_anatomy_prior,
+            use_anatomy=use_anatomy,
+        )
+        self.llm_name = llm_name
+        self.llm = AutoModelForSeq2SeqLM.from_pretrained(llm_name)
+        self.llm_dim = _hf_hidden_size(self.llm.config)
+        self.prefix_length = prefix_length
+        self.prefix_offset = nn.Parameter(torch.randn(prefix_length, self.llm_dim) * 0.02)
+        self.prefix_proj = nn.Sequential(
+            nn.Linear(embed_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.llm_dim),
+        )
+        self.llm_state_to_graph = nn.Linear(self.llm_dim, embed_dim)
+        decoder_start = getattr(self.llm.config, "decoder_start_token_id", None)
+        self.decoder_start_id = int(decoder_start if decoder_start is not None else self.bos_id)
+        if getattr(self.llm.config, "pad_token_id", None) is None:
+            self.llm.config.pad_token_id = self.pad_id
+        if getattr(self.llm.config, "eos_token_id", None) is None and eos_id is not None:
+            self.llm.config.eos_token_id = int(eos_id)
+        if freeze_llm:
+            for param in self.llm.parameters():
+                param.requires_grad = False
+
+    def _graph_prefix(
+        self,
+        region_features: torch.Tensor,
+        concept_features: torch.Tensor,
+        anatomy_features: torch.Tensor | None,
+        rc_edges: torch.Tensor,
+    ) -> torch.Tensor:
+        batch = region_features.shape[0]
+        region_summary = region_features.mean(dim=1)
+        concept_scores = torch.sigmoid(self.concept_head(concept_features).squeeze(-1))
+        concept_summary = torch.matmul(concept_scores.unsqueeze(1), concept_features).squeeze(1)
+        anatomy_summary = region_summary if anatomy_features is None else anatomy_features.mean(dim=1)
+        base = torch.cat([region_summary, anatomy_summary, concept_summary], dim=-1)
+        prefix = self.prefix_proj(base).unsqueeze(1).expand(batch, self.prefix_length, self.llm_dim)
+        return prefix + self.prefix_offset.unsqueeze(0)
+
+    def _graph_forward(
+        self,
+        images: torch.Tensor,
+        suppress_anatomy_ids: torch.Tensor | None = None,
+        suppress_concept_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+        region_features = self.region_encoder(images)
+        concept_features = self.concept_embed.unsqueeze(0).expand(images.shape[0], -1, -1)
+        concept_features, ra_edges, ac_edges, anatomy_features, rc_edges = self.build_graph_features(
+            region_features,
+            concept_features,
+            suppress_anatomy_ids,
+            suppress_concept_ids,
+        )
+        prefix = self._graph_prefix(region_features, concept_features, anatomy_features, rc_edges)
+        return prefix, region_features, ra_edges, ac_edges, anatomy_features, concept_features
+
+    def _dynamic_edges_from_decoder_hidden(
+        self,
+        decoder_hidden: torch.Tensor,
+        region_features: torch.Tensor,
+        concept_features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rc_edges = []
+        token_concept_edges = []
+        graph_queries = self.llm_state_to_graph(decoder_hidden)
+        for t in range(graph_queries.shape[1]):
+            query = graph_queries[:, t]
+            rc_edges.append(self.compute_region_concept_edges_from_query(region_features, concept_features, query))
+            token_concept_edges.append(self.compute_token_concept_edges_from_query(concept_features, query))
+        return torch.stack(rc_edges, dim=1), torch.stack(token_concept_edges, dim=1)
+
+    def _shift_right(self, labels: torch.Tensor) -> torch.Tensor:
+        if hasattr(self.llm, "_shift_right"):
+            return self.llm._shift_right(labels)
+        shifted = labels.new_full(labels.shape, self.pad_id)
+        shifted[:, 0] = self.decoder_start_id
+        shifted[:, 1:] = labels[:, :-1].masked_fill(labels[:, :-1] < 0, self.pad_id)
+        return shifted
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        tokens: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        suppress_anatomy_ids: torch.Tensor | None = None,
+        suppress_concept_ids: torch.Tensor | None = None,
+    ) -> DecodeOutput:
+        prefix, region_features, ra_edges, ac_edges, anatomy_features, concept_features = self._graph_forward(
+            images, suppress_anatomy_ids, suppress_concept_ids
+        )
+        if attention_mask is None:
+            attention_mask = (tokens != self.pad_id).long()
+        encoder_mask = torch.ones(tokens.shape[0], self.prefix_length, dtype=attention_mask.dtype, device=tokens.device)
+        labels = tokens.clone()
+        labels[attention_mask == 0] = -100
+        lm_out = self.llm(
+            inputs_embeds=prefix,
+            attention_mask=encoder_mask,
+            labels=labels,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        decoder_states = lm_out.decoder_hidden_states[-1]
+        steps = max(1, min(tokens.shape[1], decoder_states.shape[1]))
+        rc_seq, token_concept = self._dynamic_edges_from_decoder_hidden(
+            decoder_states[:, :steps],
+            region_features,
+            concept_features,
+        )
+        concept_logits = self.concept_head(concept_features).squeeze(-1)
+        return DecodeOutput(
+            lm_out.logits,
+            concept_logits,
+            rc_seq,
+            token_concept,
+            region_features,
+            concept_features,
+            ra_edges,
+            ac_edges,
+            anatomy_features,
+            lm_out.loss,
+        )
+
+    @torch.no_grad()
+    def generate(self, images: torch.Tensor, max_len: int = 96) -> tuple[DecodeOutput, torch.Tensor]:
+        prefix, region_features, ra_edges, ac_edges, anatomy_features, concept_features = self._graph_forward(images)
+        batch = images.shape[0]
+        encoder_mask = torch.ones(batch, self.prefix_length, dtype=torch.long, device=images.device)
+        raw_tokens = self.llm.generate(
+            inputs_embeds=prefix,
+            attention_mask=encoder_mask,
+            max_new_tokens=max_len,
+            pad_token_id=self.pad_id,
+            eos_token_id=self.eos_id,
+        )
+        if raw_tokens.shape[1] > 0 and bool((raw_tokens[:, 0] == self.decoder_start_id).all()):
+            gen_tokens = raw_tokens[:, 1:]
+        else:
+            gen_tokens = raw_tokens
+        decoder_input_ids = self._shift_right(gen_tokens)
+        lm_out = self.llm(
+            inputs_embeds=prefix,
+            attention_mask=encoder_mask,
+            decoder_input_ids=decoder_input_ids,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        decoder_states = lm_out.decoder_hidden_states[-1]
+        steps = min(gen_tokens.shape[1], decoder_states.shape[1])
+        if steps > 0:
+            rc_seq, token_concept = self._dynamic_edges_from_decoder_hidden(
+                decoder_states[:, :steps],
+                region_features,
+                concept_features,
+            )
+        else:
+            rc_seq = torch.empty(batch, 0, region_features.shape[1], self.num_concepts, device=images.device)
+            token_concept = torch.empty(batch, 0, self.num_concepts, device=images.device)
+        concept_logits = self.concept_head(concept_features).squeeze(-1)
+        return DecodeOutput(
+            lm_out.logits,
+            concept_logits,
+            rc_seq,
+            token_concept,
+            region_features,
+            concept_features,
+            ra_edges,
+            ac_edges,
+            anatomy_features,
+        ), gen_tokens

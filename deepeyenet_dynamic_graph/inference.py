@@ -8,7 +8,7 @@ from PIL import Image
 
 from .config import Config
 from .data import anatomy_prior_matrix, get_anatomy_names, make_transforms
-from .model import DynamicGraphCaptioner, GraphPrefixLLMCaptioner
+from .model import DynamicGraphCaptioner, GraphPrefixLLMCaptioner, GraphSeq2SeqCaptioner
 from .utils import get_device, load_json
 from .vocab import Vocabulary
 
@@ -22,6 +22,55 @@ def parse_args():
     return parser.parse_args()
 
 
+def _uses_hf_decoder(cfg: Config) -> bool:
+    return cfg.decoder_type in {"llm", "causal_lm", "seq2seq"}
+
+
+def _is_seq2seq_decoder(cfg: Config) -> bool:
+    return cfg.decoder_type == "seq2seq"
+
+
+def _prepare_tokenizer(tokenizer):
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.eos_token is None and tokenizer.pad_token is not None:
+        tokenizer.eos_token = tokenizer.pad_token
+    return tokenizer
+
+
+def _token_ids(tokenizer) -> tuple[int, int, int]:
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    bos_id = tokenizer.bos_token_id
+    if bos_id is None:
+        bos_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if bos_id is None:
+        bos_id = pad_id
+    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id
+    return int(pad_id), int(bos_id), int(eos_id)
+
+
+def _build_hf_model(cfg: Config, tokenizer, concepts: list[str]):
+    pad_id, bos_id, eos_id = _token_ids(tokenizer)
+    model_cls = GraphSeq2SeqCaptioner if _is_seq2seq_decoder(cfg) else GraphPrefixLLMCaptioner
+    return model_cls(
+        cfg.llm_name,
+        concepts,
+        pad_id,
+        bos_id,
+        eos_id,
+        cfg.embed_dim,
+        cfg.hidden_dim,
+        cfg.patch_grid,
+        cfg.dropout,
+        cfg.graph_steps,
+        get_anatomy_names(cfg.dataset),
+        anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
+        cfg.use_anatomy,
+        cfg.freeze_llm,
+        cfg.prefix_length,
+    )
+
+
 @torch.no_grad()
 def main() -> None:
     args = parse_args()
@@ -32,31 +81,12 @@ def main() -> None:
     cfg.device = args.device
     concepts = load_json(run_dir / "concepts.json")["concepts"]
     device = get_device(cfg.device)
-    if cfg.decoder_type == "llm":
+    if _uses_hf_decoder(cfg):
         from transformers import AutoTokenizer
 
         tokenizer_source = run_dir if (run_dir / "tokenizer_config.json").exists() else cfg.llm_name
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        bos_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
-        model = GraphPrefixLLMCaptioner(
-            cfg.llm_name,
-            concepts,
-            tokenizer.pad_token_id,
-            bos_id,
-            tokenizer.eos_token_id,
-            cfg.embed_dim,
-            cfg.hidden_dim,
-            cfg.patch_grid,
-            cfg.dropout,
-            cfg.graph_steps,
-            get_anatomy_names(cfg.dataset),
-            anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
-            cfg.use_anatomy,
-            cfg.freeze_llm,
-            cfg.prefix_length,
-        ).to(device)
+        tokenizer = _prepare_tokenizer(AutoTokenizer.from_pretrained(tokenizer_source))
+        model = _build_hf_model(cfg, tokenizer, concepts).to(device)
         decoder = tokenizer
     else:
         vocab = Vocabulary.from_dict(load_json(run_dir / "vocab.json"))

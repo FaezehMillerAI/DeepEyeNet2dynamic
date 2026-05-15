@@ -9,7 +9,7 @@ The original markdown describes a dynamic explanation graph for chest X-ray repo
 - Region-aware retinal image encoder using fixed spatial patches.
 - Concept vocabulary built from DeepEyeNet `Keywords`.
 - Dynamic region-to-concept graph updated during decoding.
-- LLM report decoder conditioned on the anatomy-aware explanation graph through learned soft-prefix embeddings.
+- LLM report decoders conditioned on the anatomy-aware explanation graph through learned soft-prefix embeddings, with both decoder-only and encoder-decoder HuggingFace models supported.
 - Optional GRU decoder baseline with `--decoder-type gru`.
 - Multi-task losses for report generation, concept prediction, graph alignment, sparsity, and temporal consistency.
 - Evaluation suite for text quality, clinical concept fidelity, graph behavior, evidence faithfulness, and counterfactual sensitivity.
@@ -58,7 +58,7 @@ python -m deepeyenet_dynamic_graph.train \
   --output-dir outputs/run1 \
   --epochs 10 \
   --batch-size 8 \
-  --decoder-type llm \
+  --decoder-type causal_lm \
   --llm-name distilgpt2 \
   --num-workers 0
 
@@ -86,7 +86,7 @@ python -m deepeyenet_dynamic_graph.train \
   --output-dir outputs/iuxray_run1 \
   --epochs 10 \
   --batch-size 8 \
-  --decoder-type llm \
+  --decoder-type causal_lm \
   --llm-name distilgpt2 \
   --num-workers 0
 
@@ -101,15 +101,35 @@ python -m deepeyenet_dynamic_graph.evaluate \
 
 The evaluation folder includes `interactive_explanations.html`. Open it in a browser to hover over image regions and inspect anatomy, top findings, linked report text, and counterfactual drops.
 
-## LLM Decoder
+## LLM Decoders
 
-The default model is now LLM-based. The explanation graph is converted into learned prefix embeddings:
+The default model is LLM-based. The explanation graph is converted into learned prefix embeddings:
 
 ```text
-image patch -> anatomy node -> finding node -> LLM soft prefix -> generated report
+image patch -> anatomy node -> finding node -> LLM prefix/context -> generated report
 ```
 
 During training and evaluation, the LLM hidden state at each token position recomputes the region-concept and token-concept edges. This keeps the explanation graph dynamic rather than broadcasting one static graph across the whole report.
+
+Use decoder-only causal LMs such as GPT-2/BioGPT with:
+
+```bash
+--decoder-type causal_lm --llm-name distilgpt2
+```
+
+The older alias still works:
+
+```bash
+--decoder-type llm
+```
+
+Use encoder-decoder models such as T5/FLAN-T5 with:
+
+```bash
+--decoder-type seq2seq --llm-name google/flan-t5-small
+```
+
+The design choice is deliberate: causal LMs receive the graph as learned soft-prefix tokens before the report, while seq2seq LMs receive the graph as encoder context and generate from the decoder. Both paths return the same explanation tensors, so metrics, counterfactuals, and the interactive HTML viewer remain comparable across decoder families.
 
 ## Concept Graphs
 
@@ -153,13 +173,19 @@ python -m deepeyenet_dynamic_graph.prepare_concepts \
 Default lightweight Colab setting:
 
 ```bash
---decoder-type llm --llm-name distilgpt2
+--decoder-type causal_lm --llm-name distilgpt2
 ```
 
 Stronger biomedical option:
 
 ```bash
---decoder-type llm --llm-name microsoft/BioGPT
+--decoder-type causal_lm --llm-name microsoft/BioGPT
+```
+
+Instruction-tuned encoder-decoder option:
+
+```bash
+--decoder-type seq2seq --llm-name google/flan-t5-small
 ```
 
 For a cheaper ablation, freeze the LLM and train only the image/graph/prefix modules:

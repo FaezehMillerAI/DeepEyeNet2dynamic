@@ -11,7 +11,7 @@ from tqdm import tqdm
 from .config import Config
 from .concept_graph import build_concept_graph
 from .data import HFMedicalReportDataset, MedicalReportDataset, anatomy_prior_matrix, build_artifacts, collate_fn, collate_hf_fn, get_anatomy_names, load_split_records
-from .model import DynamicGraphCaptioner, GraphPrefixLLMCaptioner, compute_losses
+from .model import DynamicGraphCaptioner, GraphPrefixLLMCaptioner, GraphSeq2SeqCaptioner, compute_losses
 from .utils import ensure_dir, get_device, save_json, set_seed
 from .vocab import build_concepts
 
@@ -32,7 +32,7 @@ def parse_args() -> Config:
     parser.add_argument("--radgraph-path", default=None)
     parser.add_argument("--concept-normalizer", choices=["rules", "llm"], default="rules")
     parser.add_argument("--concept-normalizer-model", default="gpt-4o-mini")
-    parser.add_argument("--decoder-type", choices=["llm", "gru"], default="llm")
+    parser.add_argument("--decoder-type", choices=["llm", "causal_lm", "seq2seq", "gru"], default="llm")
     parser.add_argument("--llm-name", default="distilgpt2")
     parser.add_argument("--freeze-llm", action="store_true")
     parser.add_argument("--prefix-length", type=int, default=4)
@@ -80,6 +80,55 @@ def parse_args() -> Config:
     return cfg
 
 
+def _uses_hf_decoder(cfg: Config) -> bool:
+    return cfg.decoder_type in {"llm", "causal_lm", "seq2seq"}
+
+
+def _is_seq2seq_decoder(cfg: Config) -> bool:
+    return cfg.decoder_type == "seq2seq"
+
+
+def _prepare_tokenizer(tokenizer):
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.eos_token is None and tokenizer.pad_token is not None:
+        tokenizer.eos_token = tokenizer.pad_token
+    return tokenizer
+
+
+def _token_ids(tokenizer) -> tuple[int, int, int]:
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    bos_id = tokenizer.bos_token_id
+    if bos_id is None:
+        bos_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if bos_id is None:
+        bos_id = pad_id
+    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id
+    return int(pad_id), int(bos_id), int(eos_id)
+
+
+def _build_hf_model(cfg: Config, tokenizer, concepts: list[str]):
+    pad_id, bos_id, eos_id = _token_ids(tokenizer)
+    model_cls = GraphSeq2SeqCaptioner if _is_seq2seq_decoder(cfg) else GraphPrefixLLMCaptioner
+    return model_cls(
+        cfg.llm_name,
+        concepts,
+        pad_id,
+        bos_id,
+        eos_id,
+        cfg.embed_dim,
+        cfg.hidden_dim,
+        cfg.patch_grid,
+        cfg.dropout,
+        cfg.graph_steps,
+        get_anatomy_names(cfg.dataset),
+        anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
+        cfg.use_anatomy,
+        cfg.freeze_llm,
+        cfg.prefix_length,
+    )
+
+
 def run_epoch(model, loader, optimizer, cfg: Config, device: torch.device, train: bool) -> dict[str, float]:
     model.train(train)
     totals: dict[str, float] = {}
@@ -125,12 +174,10 @@ def main() -> None:
     set_seed(cfg.seed)
     out_dir = ensure_dir(cfg.output_dir)
     device = get_device(cfg.device)
-    if cfg.decoder_type == "llm":
+    if _uses_hf_decoder(cfg):
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(cfg.llm_name)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer = _prepare_tokenizer(AutoTokenizer.from_pretrained(cfg.llm_name))
         tokenizer.save_pretrained(out_dir)
         train_records = load_split_records(cfg.data_root, "train", dataset=cfg.dataset, seed=cfg.seed)
         if cfg.concept_source == "keywords":
@@ -150,7 +197,7 @@ def main() -> None:
             from .data import infer_concepts_from_reports
             concepts = infer_concepts_from_reports(train_records, max_concepts=cfg.max_concepts)
             concept_graph = {"concepts": concepts, "relations": [], "source": "fallback_report_terms", "normalizer": cfg.concept_normalizer}
-        save_json({"llm_name": cfg.llm_name, "pad_token": tokenizer.pad_token, "source": "save_pretrained"}, out_dir / "tokenizer_meta.json")
+        save_json({"llm_name": cfg.llm_name, "decoder_type": cfg.decoder_type, "pad_token": tokenizer.pad_token, "source": "save_pretrained"}, out_dir / "tokenizer_meta.json")
         vocab = None
     else:
         vocab, concepts = build_artifacts(cfg.data_root, cfg.min_token_freq, cfg.max_vocab_size, cfg.max_concepts, dataset=cfg.dataset, seed=cfg.seed)
@@ -172,10 +219,11 @@ def main() -> None:
     save_json(concept_graph, out_dir / "concept_graph.json")
     cfg.save(out_dir / "config.json")
 
-    if cfg.decoder_type == "llm":
+    if _uses_hf_decoder(cfg):
         train_ds = HFMedicalReportDataset(cfg.data_root, "train", tokenizer, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed, concept_graph.get("per_record_concepts", {}))
         valid_ds = HFMedicalReportDataset(cfg.data_root, "valid", tokenizer, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
-        collate = functools.partial(collate_hf_fn, pad_id=tokenizer.pad_token_id)
+        pad_id, _, _ = _token_ids(tokenizer)
+        collate = functools.partial(collate_hf_fn, pad_id=pad_id)
     else:
         train_ds = MedicalReportDataset(cfg.data_root, "train", vocab, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed, concept_graph.get("per_record_concepts", {}))
         valid_ds = MedicalReportDataset(cfg.data_root, "valid", vocab, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
@@ -183,25 +231,8 @@ def main() -> None:
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, collate_fn=collate)
     valid_loader = DataLoader(valid_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=collate)
 
-    if cfg.decoder_type == "llm":
-        bos_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
-        model = GraphPrefixLLMCaptioner(
-            cfg.llm_name,
-            concepts,
-            tokenizer.pad_token_id,
-            bos_id,
-            tokenizer.eos_token_id,
-            cfg.embed_dim,
-            cfg.hidden_dim,
-            cfg.patch_grid,
-            cfg.dropout,
-            cfg.graph_steps,
-            get_anatomy_names(cfg.dataset),
-            anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
-            cfg.use_anatomy,
-            cfg.freeze_llm,
-            cfg.prefix_length,
-        ).to(device)
+    if _uses_hf_decoder(cfg):
+        model = _build_hf_model(cfg, tokenizer, concepts).to(device)
     else:
         model = DynamicGraphCaptioner(
             len(vocab.itos),
