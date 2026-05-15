@@ -24,7 +24,7 @@ from .visualize import (
     plot_metric_bars,
     write_interactive_explanations,
 )
-from .vocab import Vocabulary
+from .vocab import Vocabulary, normalize_concept
 
 
 def parse_args():
@@ -135,14 +135,53 @@ def _split_sentences(text: str) -> list[str]:
     return parts or [str(text).strip() or "empty generated report"]
 
 
+def _concept_mentions_report(concept: str, text: str) -> bool:
+    concept_l = normalize_concept(concept)
+    text_l = str(text).lower()
+    if concept_l and concept_l in text_l:
+        return True
+    aliases = {
+        "no acute cardiopulmonary abnormality": ["no acute disease", "no active disease", "no acute cardiopulmonary disease"],
+        "effusion": ["pleural effusion"],
+        "cardiomegaly": ["enlarged heart", "enlarged cardiac silhouette"],
+        "fracture": ["rib fracture", "displaced rib fracture"],
+    }
+    return any(alias in text_l for alias in aliases.get(concept_l, []))
+
+
 def _linked_sentence_id(sentences: list[str], concept_names: list[str]) -> int:
     lowered = [s.lower() for s in sentences]
     for concept in concept_names:
-        concept_l = concept.lower()
         for idx, sent in enumerate(lowered):
-            if concept_l and concept_l in sent:
+            if _concept_mentions_report(concept, sent):
                 return idx
-    return 0
+    return -1
+
+
+def _rank_patch_concepts(
+    rc_patch: np.ndarray,
+    concept_scores: np.ndarray,
+    concepts: list[str],
+    keywords: list[str],
+    prediction: str,
+    reference: str,
+    top_n: int = 3,
+) -> list[int]:
+    keyword_set = {normalize_concept(k) for k in keywords}
+    mentioned_or_supervised = np.zeros(len(concepts), dtype=bool)
+    for idx, concept in enumerate(concepts):
+        norm = normalize_concept(concept)
+        mentioned_or_supervised[idx] = (
+            norm in keyword_set
+            or _concept_mentions_report(concept, prediction)
+            or _concept_mentions_report(concept, reference)
+        )
+    weighted = rc_patch * np.clip(concept_scores, 0.0, 1.0)
+    candidate_ids = np.where(mentioned_or_supervised | (concept_scores >= 0.25))[0]
+    if candidate_ids.size == 0:
+        candidate_ids = np.arange(len(concepts))
+    ranked = candidate_ids[np.argsort(-weighted[candidate_ids])]
+    return [int(i) for i in ranked[: min(top_n, len(ranked))]]
 
 
 @torch.no_grad()
@@ -215,9 +254,11 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
                     "rc_edges": teacher_output.rc_edges[i].cpu().numpy(),
                     "token_concept_edges": teacher_output.token_concept_edges[i].cpu().numpy(),
                     "region_anatomy_edges": None if teacher_output.region_anatomy_edges is None else teacher_output.region_anatomy_edges[i].cpu().numpy(),
-                    "patch_cf_drop": float(patch_drops[-images.shape[0] + i]) if patch_drops and len(patch_drops) >= images.shape[0] else 0.0,
-                    "anatomy_cf_drop": float(anatomy_drops[-images.shape[0] + i]) if anatomy_drops and len(anatomy_drops) >= images.shape[0] else 0.0,
-                    "finding_cf_drop": float(finding_drops[-images.shape[0] + i]) if finding_drops and len(finding_drops) >= images.shape[0] else 0.0,
+                    "tested_region_id": int(region_ids[i].detach().cpu()),
+                    "tested_concept_id": int(concept_ids[i].detach().cpu()),
+                    "patch_cf_drop": float(patch_drops[-images.shape[0] + i]) if patch_drops and len(patch_drops) >= images.shape[0] else None,
+                    "anatomy_cf_drop": float(anatomy_drops[-images.shape[0] + i]) if anatomy_drops and len(anatomy_drops) >= images.shape[0] else None,
+                    "finding_cf_drop": float(finding_drops[-images.shape[0] + i]) if finding_drops and len(finding_drops) >= images.shape[0] else None,
                 }
             )
 
@@ -253,8 +294,9 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
     anatomy_names = getattr(model, "anatomy_names", [])
     for idx, ex in enumerate(examples):
         concept_scores = ex["concept_prob"]
-        top_concept = int(np.argmax(concept_scores))
-        region_scores = ex["rc_edges"][:, :, top_concept].mean(axis=0)
+        rc_mean = ex["rc_edges"].mean(axis=0)
+        region_concept_evidence = rc_mean * concept_scores[None, :]
+        region_scores = region_concept_evidence.max(axis=1)
         full_image_path = data_root / ex["image_path"]
         if full_image_path.exists():
             plot_evidence_heatmap(full_image_path, region_scores, cfg.patch_grid, output_dir / f"example_{idx}_evidence_heatmap.png")
@@ -264,30 +306,47 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
             image_copy_path = interactive_image_dir / image_copy_name
             if not image_copy_path.exists():
                 shutil.copy2(full_image_path, image_copy_path)
-            rc_mean = ex["rc_edges"].mean(axis=0)
             report_sentences = _split_sentences(ex["prediction"])
             region_strength = region_scores - region_scores.min()
             region_strength = region_strength / (region_strength.max() + 1e-8)
             patches = []
             for patch_id in range(cfg.patch_grid * cfg.patch_grid):
-                top_concepts = np.argsort(-rc_mean[patch_id])[: min(3, len(concepts))]
+                top_concepts = _rank_patch_concepts(
+                    rc_mean[patch_id],
+                    concept_scores,
+                    concepts,
+                    ex["keywords"],
+                    ex["prediction"],
+                    ex["reference"],
+                    top_n=3,
+                )
                 top_concept_names = [concepts[int(c)] for c in top_concepts]
                 linked_sid = _linked_sentence_id(report_sentences, top_concept_names)
                 anatomy = "region"
                 if ex["region_anatomy_edges"] is not None and anatomy_names:
                     anatomy_id = int(np.argmax(ex["region_anatomy_edges"][patch_id]))
                     anatomy = anatomy_names[anatomy_id]
+                patch_was_tested = patch_id == int(ex.get("tested_region_id", -1))
                 patches.append(
                     {
                         "patch_id": patch_id,
                         "anatomy": anatomy,
-                        "top_concepts": [{"name": concepts[int(c)], "score": float(rc_mean[patch_id, int(c)])} for c in top_concepts],
+                        "top_concepts": [
+                            {
+                                "name": concepts[int(c)],
+                                "score": float(region_concept_evidence[patch_id, int(c)]),
+                                "concept_confidence": float(concept_scores[int(c)]),
+                                "mentioned": bool(_concept_mentions_report(concepts[int(c)], ex["prediction"])),
+                            }
+                            for c in top_concepts
+                        ],
                         "evidence_score": float(region_strength[patch_id]),
                         "linked_sentence_id": int(linked_sid),
-                        "linked_report_text": report_sentences[linked_sid],
-                        "patch_counterfactual_drop": ex["patch_cf_drop"] if patch_id == int(np.argmax(region_scores)) else 0.0,
-                        "anatomy_counterfactual_drop": ex["anatomy_cf_drop"] if patch_id == int(np.argmax(region_scores)) else 0.0,
-                        "finding_counterfactual_drop": ex["finding_cf_drop"] if patch_id == int(np.argmax(region_scores)) else 0.0,
+                        "linked_report_text": report_sentences[linked_sid] if linked_sid >= 0 else "No generated sentence explicitly mentions these top findings.",
+                        "counterfactual_tested": bool(patch_was_tested),
+                        "patch_counterfactual_drop": ex["patch_cf_drop"] if patch_was_tested else None,
+                        "anatomy_counterfactual_drop": ex["anatomy_cf_drop"] if patch_was_tested else None,
+                        "finding_counterfactual_drop": ex["finding_cf_drop"] if patch_was_tested else None,
                     }
                 )
             interactive_examples.append(

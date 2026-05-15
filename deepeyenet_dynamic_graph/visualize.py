@@ -169,16 +169,18 @@ const examples = {payload};
 const root = document.getElementById('root');
 const tooltip = document.getElementById('tooltip');
 function esc(s) {{ return String(s ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}}[c])); }}
+function fmt(v) {{ return v === null || v === undefined ? 'not tested' : Number(v).toFixed(3); }}
 function patchTip(p) {{
-  const concepts = p.top_concepts.map(c => `<span class="pill">${{esc(c.name)}} ${{Number(c.score).toFixed(3)}}</span>`).join('');
+  const concepts = p.top_concepts.map(c => `<span class="pill">${{esc(c.name)}} evidence ${{Number(c.score).toFixed(3)}} - conf ${{Number(c.concept_confidence ?? 0).toFixed(3)}}${{c.mentioned ? ' - mentioned' : ''}}</span>`).join('');
   return `<b>Patch R${{p.patch_id}}</b><br>
   Anatomy: <b>${{esc(p.anatomy)}}</b><br>
   Evidence score: ${{Number(p.evidence_score ?? 0).toFixed(3)}}<div class="scorebar"><span style="width:${{Math.max(0, Math.min(100, Number(p.evidence_score ?? 0) * 100))}}%"></span></div>
   Top findings:<br>${{concepts}}<br>
   Linked report: <i>${{esc(p.linked_report_text)}}</i><br>
-  Patch CF drop: ${{Number(p.patch_counterfactual_drop ?? 0).toFixed(3)}}<br>
-  Anatomy CF drop: ${{Number(p.anatomy_counterfactual_drop ?? 0).toFixed(3)}}<br>
-  Finding CF drop: ${{Number(p.finding_counterfactual_drop ?? 0).toFixed(3)}}`;
+  Counterfactual: ${{p.counterfactual_tested ? 'tested on this patch' : 'not tested for this patch'}}<br>
+  Patch CF drop: ${{fmt(p.patch_counterfactual_drop)}}<br>
+  Anatomy CF drop: ${{fmt(p.anatomy_counterfactual_drop)}}<br>
+  Finding CF drop: ${{fmt(p.finding_counterfactual_drop)}}`;
 }}
 examples.forEach((ex, idx) => {{
   const div = document.createElement('section');
@@ -199,7 +201,7 @@ examples.forEach((ex, idx) => {{
     cell.style.background = `rgba(42,157,143,${{0.05 + 0.28 * Number(p.evidence_score ?? 0)}})`;
     cell.addEventListener('mousemove', ev => {{
       document.querySelectorAll(`[data-case="${{idx}}"] .sentence`).forEach(s => s.classList.remove('active'));
-      const linked = document.querySelector(`[data-case="${{idx}}"] .sentence[data-sid="${{p.linked_sentence_id ?? 0}}"]`);
+      const linked = document.querySelector(`[data-case="${{idx}}"] .sentence[data-sid="${{p.linked_sentence_id}}"]`);
       if (linked) linked.classList.add('active');
       tooltip.style.display = 'block';
       tooltip.style.left = (ev.clientX + 14) + 'px';
