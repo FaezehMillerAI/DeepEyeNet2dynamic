@@ -176,6 +176,27 @@ Training writes:
 ```text
 concept_graph.json
 concept_normalization_cache.json
+relation_extraction_cache.json
+```
+
+The graph can also include report-derived anatomy-finding relations. With the default rule extractor, reports create edges such as:
+
+```text
+pleura --has_absent_finding--> pneumothorax
+cardiac silhouette --has_normal_status--> cardiomegaly
+```
+
+For LLM-assisted relation extraction, set `OPENAI_API_KEY` and add:
+
+```bash
+--relation-extractor llm \
+--relation-extractor-model gpt-4o-mini
+```
+
+These relations are saved in `concept_graph.json` and converted into an anatomy-to-concept prior inside the dynamic graph layer. The prior strength is controlled by:
+
+```bash
+--relation-prior-weight 1.0
 ```
 
 You can inspect concept extraction separately:
@@ -185,7 +206,8 @@ python -m deepeyenet_dynamic_graph.prepare_concepts \
   --dataset iuxray \
   --data-root /path/to/IU-XRay \
   --output outputs/iuxray_concept_graph.json \
-  --radgraph-path /path/to/radgraph_outputs.json
+  --radgraph-path /path/to/radgraph_outputs.json \
+  --relation-extractor llm
 ```
 
 Default lightweight Colab setting:

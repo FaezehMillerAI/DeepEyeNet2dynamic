@@ -7,6 +7,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from .data import get_anatomy_names, normalize_dataset_name
 from .vocab import normalize_concept
 
 
@@ -61,6 +62,60 @@ CLINICAL_FALLBACK_TERMS = [
     "tumor",
     "suprachoroidal hemorrhage",
 ]
+
+NEGATION_PATTERNS = [
+    r"\bno\b",
+    r"\bwithout\b",
+    r"\bnegative for\b",
+    r"\bno evidence of\b",
+    r"\bno focal\b",
+    r"\babsent\b",
+]
+
+NORMAL_PATTERNS = [
+    r"\bnormal\b",
+    r"\bunremarkable\b",
+    r"\bwithin normal limits\b",
+    r"\bclear\b",
+]
+
+ANATOMY_ALIASES = {
+    "iuxray": {
+        "left upper lung": ["left upper lung", "left upper lobe", "left apex"],
+        "left lower lung": ["left lower lung", "left lower lobe", "left base", "left basilar"],
+        "right upper lung": ["right upper lung", "right upper lobe", "right apex"],
+        "right lower lung": ["right lower lung", "right lower lobe", "right base", "right basilar"],
+        "cardiac silhouette": ["heart", "cardiac silhouette", "cardiomediastinal silhouette"],
+        "mediastinum": ["mediastinum", "mediastinal", "hilar", "hilum"],
+        "pleura": ["pleura", "pleural", "costophrenic", "pneumothorax", "effusion"],
+    },
+    "deepeyenet": {
+        "superior retina": ["superior retina", "superior"],
+        "inferior retina": ["inferior retina", "inferior"],
+        "nasal retina": ["nasal retina", "nasal"],
+        "temporal retina": ["temporal retina", "temporal"],
+        "macula": ["macula", "macular", "fovea"],
+        "optic disc": ["optic disc", "disc", "papilla"],
+        "retinal vessels": ["retinal vessels", "vessel", "vascular", "artery", "vein"],
+    },
+}
+
+CONCEPT_ANATOMY_PRIORS = {
+    "cardiomegaly": ["cardiac silhouette"],
+    "effusion": ["pleura", "left lower lung", "right lower lung"],
+    "pleural effusion": ["pleura", "left lower lung", "right lower lung"],
+    "pneumothorax": ["pleura", "left upper lung", "right upper lung"],
+    "opacity": ["left upper lung", "left lower lung", "right upper lung", "right lower lung"],
+    "pneumonia": ["left upper lung", "left lower lung", "right upper lung", "right lower lung"],
+    "atelectasis": ["left lower lung", "right lower lung"],
+    "edema": ["left upper lung", "left lower lung", "right upper lung", "right lower lung"],
+    "fracture": ["pleura"],
+    "macular hole": ["macula"],
+    "cone dystrophy": ["macula"],
+    "morning glory syndrome": ["optic disc"],
+    "neovascularization of the disc": ["optic disc"],
+    "uveitis": ["retina"],
+}
 
 
 def rule_normalize_concept(text: str) -> str:
@@ -124,6 +179,156 @@ def _record_key(record: dict[str, Any]) -> str:
     return str(record.get("image_path", ""))
 
 
+def _split_sentences(text: str) -> list[str]:
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", str(text)) if s.strip()]
+
+
+def _sentence_status(sentence: str, concept: str) -> str:
+    sent = sentence.lower()
+    concept_l = normalize_concept(concept)
+    if concept_l == "no acute cardiopulmonary abnormality" and re.search(r"\bno acute\b|\bno active disease\b|\bnormal chest\b", sent):
+        return "normal"
+    concept_pos = sent.find(concept_l) if concept_l else -1
+    window = sent if concept_pos < 0 else sent[max(0, concept_pos - 48) : concept_pos + len(concept_l) + 48]
+    if re.search(r"\bno\b.{0,160}\b(identified|seen|noted|present|evident|visualized)\b", sent):
+        return "absent"
+    if any(re.search(pattern, window) for pattern in NEGATION_PATTERNS):
+        return "absent"
+    if any(re.search(pattern, sent) for pattern in NORMAL_PATTERNS) and concept_l in {"no acute cardiopulmonary abnormality"}:
+        return "normal"
+    return "present"
+
+
+def _relation_type(status: str) -> str:
+    if status == "absent":
+        return "has_absent_finding"
+    if status == "normal":
+        return "has_normal_status"
+    return "has_present_finding"
+
+
+def _find_sentence_anatomy(sentence: str, dataset: str) -> list[str]:
+    dataset = normalize_dataset_name(dataset)
+    sent = sentence.lower()
+    anatomy = []
+    for node, aliases in ANATOMY_ALIASES.get(dataset, {}).items():
+        if any(re.search(rf"\b{re.escape(alias)}\b", sent) for alias in aliases):
+            anatomy.append(node)
+    return sorted(set(anatomy))
+
+
+def _infer_anatomy_for_concept(concept: str, dataset: str) -> list[str]:
+    dataset = normalize_dataset_name(dataset)
+    anatomy_names = get_anatomy_names(dataset)
+    concept_l = normalize_concept(concept)
+    priors = []
+    for key, nodes in CONCEPT_ANATOMY_PRIORS.items():
+        if key in concept_l or concept_l in key:
+            priors.extend(n for n in nodes if n in anatomy_names)
+    if priors:
+        return sorted(set(priors))
+    if dataset == "iuxray":
+        return [n for n in anatomy_names if "lung" in n]
+    return anatomy_names[:]
+
+
+def rule_extract_relations(record: dict[str, Any], concepts: list[str], dataset: str) -> list[dict[str, str]]:
+    text = " ".join(str(record.get(field, "")) for field in ["clinical_description", "report_text"])
+    sentences = _split_sentences(text)
+    concepts_l = [(concept, normalize_concept(concept)) for concept in concepts]
+    relations = []
+    for sent in sentences:
+        sent_l = sent.lower()
+        present_concepts = [concept for concept, norm in concepts_l if norm and re.search(rf"\b{re.escape(norm)}\b", sent_l)]
+        if not present_concepts:
+            continue
+        anatomy_nodes = _find_sentence_anatomy(sent, dataset)
+        for concept in present_concepts:
+            status = _sentence_status(sent, concept)
+            nodes = anatomy_nodes or _infer_anatomy_for_concept(concept, dataset)
+            for anatomy in nodes:
+                relations.append(
+                    {
+                        "source": anatomy,
+                        "type": _relation_type(status),
+                        "target": concept,
+                        "status": status,
+                        "evidence": sent,
+                        "extractor": "rules",
+                    }
+                )
+    return relations
+
+
+def llm_extract_relations(
+    record: dict[str, Any],
+    concepts: list[str],
+    anatomy_names: list[str],
+    cache: dict[str, Any],
+    model: str = "gpt-4o-mini",
+) -> list[dict[str, str]]:
+    key = _record_key(record)
+    if key in cache:
+        cached = cache[key]
+        return cached if isinstance(cached, list) else []
+    if not os.environ.get("OPENAI_API_KEY"):
+        return []
+    try:
+        from openai import OpenAI
+
+        client = OpenAI()
+        prompt = {
+            "task": "Extract clinically grounded anatomy-finding relations from this report.",
+            "allowed_anatomy_nodes": anatomy_names,
+            "allowed_finding_nodes": concepts,
+            "allowed_relation_types": ["has_present_finding", "has_absent_finding", "has_normal_status", "related_to"],
+            "output_schema": [
+                {"source": "anatomy node", "type": "relation type", "target": "finding node", "status": "present|absent|normal|unknown", "evidence": "short report span"}
+            ],
+            "report": str(record.get("report_text", "")),
+            "clinical_description": str(record.get("clinical_description", "")),
+        }
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You extract conservative medical graph relations. Use only allowed node names. Return only JSON array.",
+                },
+                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+            ],
+            temperature=0,
+        )
+        text = response.choices[0].message.content or "[]"
+        parsed = json.loads(text[text.find("[") : text.rfind("]") + 1])
+        allowed_anatomy = set(anatomy_names)
+        allowed_concepts = set(concepts)
+        allowed_types = {"has_present_finding", "has_absent_finding", "has_normal_status", "related_to"}
+        relations = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            src = str(item.get("source", ""))
+            tgt = str(item.get("target", ""))
+            rel_type = str(item.get("type", "related_to"))
+            if src in allowed_anatomy and tgt in allowed_concepts and rel_type in allowed_types:
+                status = str(item.get("status", "unknown"))
+                relations.append(
+                    {
+                        "source": src,
+                        "type": rel_type,
+                        "target": tgt,
+                        "status": status,
+                        "evidence": str(item.get("evidence", ""))[:300],
+                        "extractor": "llm",
+                    }
+                )
+        cache[key] = relations
+        return relations
+    except Exception:
+        return []
+
+
 def _iter_radgraph_docs(radgraph_path: str | Path) -> list[tuple[str, dict[str, Any]]]:
     path = Path(radgraph_path)
     if not path.exists():
@@ -174,10 +379,18 @@ def build_concept_graph(
     normalizer: str = "rules",
     normalizer_cache: str | Path | None = None,
     llm_model: str = "gpt-4o-mini",
+    relation_extractor: str = "rules",
+    relation_extractor_model: str = "gpt-4o-mini",
+    relation_cache: str | Path | None = None,
+    dataset: str = "iuxray",
 ) -> dict[str, Any]:
     counter: Counter[str] = Counter()
     relation_counter: Counter[tuple[str, str, str]] = Counter()
+    relation_examples: dict[tuple[str, str, str], str] = {}
+    per_record_relations: dict[str, list[dict[str, str]]] = {}
     per_record: dict[str, list[str]] = {}
+    dataset = normalize_dataset_name(dataset)
+    anatomy_names = get_anatomy_names(dataset)
 
     rad_docs = dict(_iter_radgraph_docs(radgraph_path)) if radgraph_path else {}
     for record in records:
@@ -218,15 +431,50 @@ def build_concept_graph(
             per_record[key] = sorted(set(mapping.get(v, v) for v in vals))
 
     concept_set = set(concepts)
+    relation_cache_path = Path(relation_cache) if relation_cache else None
+    if relation_cache_path and relation_cache_path.exists():
+        relation_cache_data = json.loads(relation_cache_path.read_text())
+    else:
+        relation_cache_data = {}
+    if relation_extractor != "none":
+        for record in records:
+            key = _record_key(record)
+            record_concepts = [c for c in per_record.get(key, []) if c in concept_set]
+            if not record_concepts:
+                continue
+            llm_relations = []
+            if relation_extractor == "llm":
+                llm_relations = llm_extract_relations(record, record_concepts, anatomy_names, relation_cache_data, model=relation_extractor_model)
+            relations = llm_relations or rule_extract_relations(record, record_concepts, dataset)
+            filtered = []
+            for rel in relations:
+                src = str(rel.get("source", ""))
+                rel_type = str(rel.get("type", "related_to"))
+                tgt = rule_normalize_concept(str(rel.get("target", "")))
+                if src not in anatomy_names or tgt not in concept_set:
+                    continue
+                edge = (src, rel_type, tgt)
+                relation_counter[edge] += 1
+                if edge not in relation_examples and rel.get("evidence"):
+                    relation_examples[edge] = str(rel.get("evidence", ""))
+                filtered.append({**rel, "target": tgt})
+            per_record_relations[key] = filtered
+    if relation_cache_path:
+        relation_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        relation_cache_path.write_text(json.dumps(relation_cache_data, indent=2, ensure_ascii=False))
+
     relations_out = [
-        {"source": src, "type": rel, "target": tgt, "count": count}
+        {"source": src, "type": rel, "target": tgt, "count": count, "evidence": relation_examples.get((src, rel, tgt), "")}
         for (src, rel, tgt), count in relation_counter.most_common()
-        if src in concept_set and tgt in concept_set
+        if (src in concept_set or src in anatomy_names) and tgt in concept_set
     ]
     return {
         "concepts": concepts,
+        "anatomy_nodes": anatomy_names,
         "relations": relations_out,
         "per_record_concepts": per_record,
+        "per_record_relations": per_record_relations,
         "source": "radgraph" if rad_docs else "keywords_or_lexicon",
         "normalizer": normalizer,
+        "relation_extractor": relation_extractor,
     }

@@ -18,6 +18,8 @@ def parse_args():
     parser.add_argument("--radgraph-path", default=None)
     parser.add_argument("--concept-normalizer", choices=["rules", "llm"], default="rules")
     parser.add_argument("--concept-normalizer-model", default="gpt-4o-mini")
+    parser.add_argument("--relation-extractor", choices=["none", "rules", "llm"], default="rules")
+    parser.add_argument("--relation-extractor-model", default="gpt-4o-mini")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -33,6 +35,10 @@ def main() -> None:
         normalizer=args.concept_normalizer,
         normalizer_cache=output.parent / "concept_normalization_cache.json",
         llm_model=args.concept_normalizer_model,
+        relation_extractor=args.relation_extractor,
+        relation_extractor_model=args.relation_extractor_model,
+        relation_cache=output.parent / "relation_extraction_cache.json",
+        dataset=args.dataset,
     )
     save_json(graph, output)
     print(f"Saved concept graph to {output}")
@@ -42,6 +48,9 @@ def main() -> None:
     print("Top concepts:")
     for concept in graph["concepts"][:20]:
         print(f"- {concept}")
+    print("Top relations:")
+    for rel in graph["relations"][:20]:
+        print(f"- {rel['source']} --{rel['type']}--> {rel['target']} ({rel['count']})")
 
 
 if __name__ == "__main__":

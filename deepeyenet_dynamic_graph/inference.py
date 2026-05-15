@@ -49,7 +49,24 @@ def _token_ids(tokenizer) -> tuple[int, int, int]:
     return int(pad_id), int(bos_id), int(eos_id)
 
 
-def _build_hf_model(cfg: Config, tokenizer, concepts: list[str]):
+def _anatomy_concept_prior_from_graph(cfg: Config, concepts: list[str], concept_graph: dict | None) -> torch.Tensor:
+    anatomy_names = get_anatomy_names(cfg.dataset)
+    prior = torch.ones(len(anatomy_names), len(concepts), dtype=torch.float32)
+    if concept_graph:
+        anatomy_to_idx = {name: idx for idx, name in enumerate(anatomy_names)}
+        concept_to_idx = {name: idx for idx, name in enumerate(concepts)}
+        for rel in concept_graph.get("relations", []):
+            src = rel.get("source")
+            tgt = rel.get("target")
+            if src in anatomy_to_idx and tgt in concept_to_idx:
+                weight = float(rel.get("count", 1.0))
+                if rel.get("type") == "has_present_finding":
+                    weight *= 1.25
+                prior[anatomy_to_idx[src], concept_to_idx[tgt]] += weight
+    return prior / prior.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+
+def _build_hf_model(cfg: Config, tokenizer, concepts: list[str], concept_graph: dict | None = None):
     pad_id, bos_id, eos_id = _token_ids(tokenizer)
     model_cls = GraphSeq2SeqCaptioner if _is_seq2seq_decoder(cfg) else GraphPrefixLLMCaptioner
     return model_cls(
@@ -65,6 +82,8 @@ def _build_hf_model(cfg: Config, tokenizer, concepts: list[str]):
         cfg.graph_steps,
         get_anatomy_names(cfg.dataset),
         anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
+        _anatomy_concept_prior_from_graph(cfg, concepts, concept_graph),
+        cfg.relation_prior_weight,
         cfg.use_anatomy,
         cfg.freeze_llm,
         cfg.prefix_length,
@@ -81,13 +100,15 @@ def main() -> None:
         cfg.decoder_type = "gru"
     cfg.device = args.device
     concepts = load_json(run_dir / "concepts.json")["concepts"]
+    concept_graph_path = run_dir / "concept_graph.json"
+    concept_graph = load_json(concept_graph_path) if concept_graph_path.exists() else None
     device = get_device(cfg.device)
     if _uses_hf_decoder(cfg):
         from transformers import AutoTokenizer
 
         tokenizer_source = run_dir if (run_dir / "tokenizer_config.json").exists() else cfg.llm_name
         tokenizer = _prepare_tokenizer(AutoTokenizer.from_pretrained(tokenizer_source))
-        model = _build_hf_model(cfg, tokenizer, concepts).to(device)
+        model = _build_hf_model(cfg, tokenizer, concepts, concept_graph).to(device)
         decoder = tokenizer
     else:
         vocab = Vocabulary.from_dict(load_json(run_dir / "vocab.json"))
@@ -104,6 +125,8 @@ def main() -> None:
             cfg.graph_steps,
             get_anatomy_names(cfg.dataset),
             anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
+            _anatomy_concept_prior_from_graph(cfg, concepts, concept_graph),
+            cfg.relation_prior_weight,
             cfg.use_anatomy,
         ).to(device)
         decoder = vocab

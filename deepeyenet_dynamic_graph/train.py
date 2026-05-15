@@ -32,6 +32,9 @@ def parse_args() -> Config:
     parser.add_argument("--radgraph-path", default=None)
     parser.add_argument("--concept-normalizer", choices=["rules", "llm"], default="rules")
     parser.add_argument("--concept-normalizer-model", default="gpt-4o-mini")
+    parser.add_argument("--relation-extractor", choices=["none", "rules", "llm"], default="rules")
+    parser.add_argument("--relation-extractor-model", default="gpt-4o-mini")
+    parser.add_argument("--relation-prior-weight", type=float, default=1.0)
     parser.add_argument("--decoder-type", choices=["llm", "causal_lm", "seq2seq", "gru"], default="llm")
     parser.add_argument("--llm-name", default="distilgpt2")
     parser.add_argument("--freeze-llm", action="store_true")
@@ -64,6 +67,9 @@ def parse_args() -> Config:
         radgraph_path=args.radgraph_path,
         concept_normalizer=args.concept_normalizer,
         concept_normalizer_model=args.concept_normalizer_model,
+        relation_extractor=args.relation_extractor,
+        relation_extractor_model=args.relation_extractor_model,
+        relation_prior_weight=args.relation_prior_weight,
         decoder_type=args.decoder_type,
         llm_name=args.llm_name,
         freeze_llm=args.freeze_llm,
@@ -111,7 +117,24 @@ def _token_ids(tokenizer) -> tuple[int, int, int]:
     return int(pad_id), int(bos_id), int(eos_id)
 
 
-def _build_hf_model(cfg: Config, tokenizer, concepts: list[str]):
+def _anatomy_concept_prior_from_graph(cfg: Config, concepts: list[str], concept_graph: dict | None) -> torch.Tensor:
+    anatomy_names = get_anatomy_names(cfg.dataset)
+    prior = torch.ones(len(anatomy_names), len(concepts), dtype=torch.float32)
+    if concept_graph:
+        anatomy_to_idx = {name: idx for idx, name in enumerate(anatomy_names)}
+        concept_to_idx = {name: idx for idx, name in enumerate(concepts)}
+        for rel in concept_graph.get("relations", []):
+            src = rel.get("source")
+            tgt = rel.get("target")
+            if src in anatomy_to_idx and tgt in concept_to_idx:
+                weight = float(rel.get("count", 1.0))
+                if rel.get("type") == "has_present_finding":
+                    weight *= 1.25
+                prior[anatomy_to_idx[src], concept_to_idx[tgt]] += weight
+    return prior / prior.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+
+def _build_hf_model(cfg: Config, tokenizer, concepts: list[str], concept_graph: dict | None = None):
     pad_id, bos_id, eos_id = _token_ids(tokenizer)
     model_cls = GraphSeq2SeqCaptioner if _is_seq2seq_decoder(cfg) else GraphPrefixLLMCaptioner
     return model_cls(
@@ -127,6 +150,8 @@ def _build_hf_model(cfg: Config, tokenizer, concepts: list[str]):
         cfg.graph_steps,
         get_anatomy_names(cfg.dataset),
         anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
+        _anatomy_concept_prior_from_graph(cfg, concepts, concept_graph),
+        cfg.relation_prior_weight,
         cfg.use_anatomy,
         cfg.freeze_llm,
         cfg.prefix_length,
@@ -191,8 +216,21 @@ def main() -> None:
         tokenizer.save_pretrained(out_dir)
         train_records = load_split_records(cfg.data_root, "train", dataset=cfg.dataset, seed=cfg.seed)
         if cfg.concept_source == "keywords":
-            concepts = build_concepts((r["keywords"] for r in train_records), max_concepts=cfg.max_concepts)
-            concept_graph = {"concepts": concepts, "relations": [], "source": "keywords", "normalizer": "none"}
+            if cfg.relation_extractor == "none":
+                concepts = build_concepts((r["keywords"] for r in train_records), max_concepts=cfg.max_concepts)
+                concept_graph = {"concepts": concepts, "relations": [], "source": "keywords", "normalizer": "none"}
+            else:
+                concept_graph = build_concept_graph(
+                    train_records,
+                    cfg.max_concepts,
+                    radgraph_path=None,
+                    normalizer="rules",
+                    relation_extractor=cfg.relation_extractor,
+                    relation_extractor_model=cfg.relation_extractor_model,
+                    relation_cache=out_dir / "relation_extraction_cache.json",
+                    dataset=cfg.dataset,
+                )
+                concepts = concept_graph["concepts"]
         else:
             concept_graph = build_concept_graph(
                 train_records,
@@ -201,6 +239,10 @@ def main() -> None:
                 normalizer=cfg.concept_normalizer,
                 normalizer_cache=out_dir / "concept_normalization_cache.json",
                 llm_model=cfg.concept_normalizer_model,
+                relation_extractor=cfg.relation_extractor,
+                relation_extractor_model=cfg.relation_extractor_model,
+                relation_cache=out_dir / "relation_extraction_cache.json",
+                dataset=cfg.dataset,
             )
             concepts = concept_graph["concepts"]
         if not concepts:
@@ -220,10 +262,27 @@ def main() -> None:
                 normalizer=cfg.concept_normalizer,
                 normalizer_cache=out_dir / "concept_normalization_cache.json",
                 llm_model=cfg.concept_normalizer_model,
+                relation_extractor=cfg.relation_extractor,
+                relation_extractor_model=cfg.relation_extractor_model,
+                relation_cache=out_dir / "relation_extraction_cache.json",
+                dataset=cfg.dataset,
             )
             concepts = concept_graph["concepts"] or concepts
         else:
-            concept_graph = {"concepts": concepts, "relations": [], "source": "keywords", "normalizer": "none"}
+            if cfg.relation_extractor == "none":
+                concept_graph = {"concepts": concepts, "relations": [], "source": "keywords", "normalizer": "none"}
+            else:
+                concept_graph = build_concept_graph(
+                    train_records,
+                    cfg.max_concepts,
+                    radgraph_path=None,
+                    normalizer="rules",
+                    relation_extractor=cfg.relation_extractor,
+                    relation_extractor_model=cfg.relation_extractor_model,
+                    relation_cache=out_dir / "relation_extraction_cache.json",
+                    dataset=cfg.dataset,
+                )
+                concepts = concept_graph["concepts"] or concepts
         save_json(vocab.to_dict(), out_dir / "vocab.json")
     save_json({"concepts": concepts}, out_dir / "concepts.json")
     save_json(concept_graph, out_dir / "concept_graph.json")
@@ -242,7 +301,7 @@ def main() -> None:
     valid_loader = DataLoader(valid_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=collate)
 
     if _uses_hf_decoder(cfg):
-        model = _build_hf_model(cfg, tokenizer, concepts).to(device)
+        model = _build_hf_model(cfg, tokenizer, concepts, concept_graph).to(device)
     else:
         model = DynamicGraphCaptioner(
             len(vocab.itos),
@@ -257,6 +316,8 @@ def main() -> None:
             cfg.graph_steps,
             get_anatomy_names(cfg.dataset),
             anatomy_prior_matrix(cfg.dataset, cfg.patch_grid),
+            _anatomy_concept_prior_from_graph(cfg, concepts, concept_graph),
+            cfg.relation_prior_weight,
             cfg.use_anatomy,
         ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)

@@ -128,6 +128,8 @@ class DynamicGraphCaptioner(nn.Module):
         graph_steps: int = 1,
         anatomy_names: list[str] | None = None,
         region_anatomy_prior: torch.Tensor | None = None,
+        anatomy_concept_prior: torch.Tensor | None = None,
+        relation_prior_weight: float = 1.0,
         use_anatomy: bool = True,
     ) -> None:
         super().__init__()
@@ -158,6 +160,10 @@ class DynamicGraphCaptioner(nn.Module):
         if region_anatomy_prior is None:
             region_anatomy_prior = torch.full((patch_grid * patch_grid, max(1, self.num_anatomy)), 1.0 / max(1, self.num_anatomy))
         self.register_buffer("region_anatomy_prior", region_anatomy_prior.float())
+        if anatomy_concept_prior is None:
+            anatomy_concept_prior = torch.full((max(1, self.num_anatomy), max(1, self.num_concepts)), 1.0 / max(1, self.num_concepts))
+        self.register_buffer("anatomy_concept_prior", anatomy_concept_prior.float())
+        self.relation_prior_weight = float(relation_prior_weight)
 
     def compute_region_concept_edges(
         self, region_features: torch.Tensor, concept_features: torch.Tensor, hidden: torch.Tensor | None = None
@@ -182,6 +188,9 @@ class DynamicGraphCaptioner(nn.Module):
     def compute_anatomy_concept_edges(self, anatomy_features: torch.Tensor, concept_features: torch.Tensor) -> torch.Tensor:
         scores = torch.matmul(self.anatomy_proj(anatomy_features), self.concept_proj(concept_features).transpose(1, 2))
         scores = scores / (anatomy_features.shape[-1] ** 0.5)
+        if self.relation_prior_weight > 0:
+            prior = self.anatomy_concept_prior[: self.num_anatomy, : self.num_concepts].to(scores.device).clamp_min(1e-8).log()
+            scores = scores + self.relation_prior_weight * prior.unsqueeze(0)
         return F.softmax(scores, dim=-1)
 
     def compute_region_concept_edges_from_query(
@@ -399,6 +408,8 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         graph_steps: int = 1,
         anatomy_names: list[str] | None = None,
         region_anatomy_prior: torch.Tensor | None = None,
+        anatomy_concept_prior: torch.Tensor | None = None,
+        relation_prior_weight: float = 1.0,
         use_anatomy: bool = True,
         freeze_llm: bool = False,
         prefix_length: int = 4,
@@ -420,6 +431,8 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
             graph_steps=graph_steps,
             anatomy_names=anatomy_names,
             region_anatomy_prior=region_anatomy_prior,
+            anatomy_concept_prior=anatomy_concept_prior,
+            relation_prior_weight=relation_prior_weight,
             use_anatomy=use_anatomy,
         )
         self.llm_name = llm_name
@@ -626,6 +639,8 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         graph_steps: int = 1,
         anatomy_names: list[str] | None = None,
         region_anatomy_prior: torch.Tensor | None = None,
+        anatomy_concept_prior: torch.Tensor | None = None,
+        relation_prior_weight: float = 1.0,
         use_anatomy: bool = True,
         freeze_llm: bool = False,
         prefix_length: int = 4,
@@ -648,6 +663,8 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
             graph_steps=graph_steps,
             anatomy_names=anatomy_names,
             region_anatomy_prior=region_anatomy_prior,
+            anatomy_concept_prior=anatomy_concept_prior,
+            relation_prior_weight=relation_prior_weight,
             use_anatomy=use_anatomy,
         )
         self.llm_name = llm_name

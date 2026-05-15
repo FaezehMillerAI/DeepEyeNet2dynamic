@@ -22,6 +22,9 @@ class Config:
     radgraph_path: str | None = None
     concept_normalizer: str = "rules"
     concept_normalizer_model: str = "gpt-4o-mini"
+    relation_extractor: str = "rules"
+    relation_extractor_model: str = "gpt-4o-mini"
+    relation_prior_weight: float = 1.0
     embed_dim: int = 256
     hidden_dim: int = 256
     decoder_type: str = "llm"
@@ -59,4 +62,8 @@ class Config:
 
     @classmethod
     def load(cls, path: str | Path) -> "Config":
-        return cls(**json.loads(Path(path).read_text()))
+        raw = json.loads(Path(path).read_text())
+        defaults = cls(data_root=raw.get("data_root", "")).to_dict()
+        defaults.update(raw)
+        allowed = set(cls.__dataclass_fields__.keys())
+        return cls(**{k: v for k, v in defaults.items() if k in allowed})
