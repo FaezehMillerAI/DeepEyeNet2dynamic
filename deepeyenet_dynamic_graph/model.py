@@ -29,6 +29,52 @@ def _hf_hidden_size(config) -> int:
     raise ValueError(f"Could not infer HuggingFace hidden size from {config.__class__.__name__}")
 
 
+CONCEPT_DECODER_ALIASES = {
+    "effusion": ["effusion", "pleural effusion"],
+    "pneumothorax": ["pneumothorax"],
+    "cardiomegaly": ["cardiomegaly", "enlarged heart"],
+    "fracture": ["fracture", "rib fracture"],
+    "opacity": ["opacity", "opacities"],
+    "no acute cardiopulmonary abnormality": ["no acute disease", "no acute cardiopulmonary abnormality"],
+}
+
+
+def _concept_surfaces(concept: str) -> list[str]:
+    concept_l = " ".join(str(concept).lower().split())
+    surfaces = [concept_l]
+    surfaces.extend(CONCEPT_DECODER_ALIASES.get(concept_l, []))
+    deduped = []
+    for item in surfaces:
+        if item and item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
+def _build_concept_token_mask(tokenizer, concept_names: list[str], vocab_size: int) -> torch.Tensor:
+    mask = torch.zeros(len(concept_names), vocab_size, dtype=torch.float32)
+    special_ids = {
+        int(idx)
+        for idx in [
+            getattr(tokenizer, "pad_token_id", None),
+            getattr(tokenizer, "bos_token_id", None),
+            getattr(tokenizer, "eos_token_id", None),
+            getattr(tokenizer, "unk_token_id", None),
+        ]
+        if idx is not None and int(idx) >= 0
+    }
+    for concept_idx, concept in enumerate(concept_names):
+        token_ids: set[int] = set()
+        for surface in _concept_surfaces(concept):
+            encoded = tokenizer(surface, add_special_tokens=False)
+            for token_id in encoded.get("input_ids", []):
+                token_id = int(token_id)
+                if 0 <= token_id < vocab_size and token_id not in special_ids:
+                    token_ids.add(token_id)
+        for token_id in token_ids:
+            mask[concept_idx, token_id] = 1.0 / max(1, len(token_ids))
+    return mask
+
+
 class RegionEncoder(nn.Module):
     """Compact patch encoder for retinal region nodes."""
 
@@ -356,8 +402,9 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         use_anatomy: bool = True,
         freeze_llm: bool = False,
         prefix_length: int = 4,
+        concept_logit_bias: float = 0.8,
     ) -> None:
-        from transformers import AutoModelForCausalLM
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         dummy_vocab_size = max(int(pad_id or 0), int(bos_id or 0), int(eos_id or 0), 8) + 1
         super().__init__(
@@ -378,6 +425,13 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         self.llm_name = llm_name
         self.llm = AutoModelForCausalLM.from_pretrained(llm_name)
         self.llm_dim = _hf_hidden_size(self.llm.config)
+        self.concept_logit_bias = float(concept_logit_bias)
+        tokenizer = AutoTokenizer.from_pretrained(llm_name)
+        self.register_buffer(
+            "concept_token_mask",
+            _build_concept_token_mask(tokenizer, concept_names, int(self.llm.config.vocab_size)),
+            persistent=False,
+        )
         self.prefix_length = prefix_length
         self.prefix_offset = nn.Parameter(torch.randn(prefix_length, self.llm_dim) * 0.02)
         self.prefix_proj = nn.Sequential(
@@ -389,6 +443,37 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         if freeze_llm:
             for param in self.llm.parameters():
                 param.requires_grad = False
+
+    def _apply_concept_logit_bias(
+        self,
+        logits: torch.Tensor,
+        token_concept_edges: torch.Tensor,
+        concept_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.concept_logit_bias <= 0 or self.concept_token_mask.numel() == 0 or logits.numel() == 0:
+            return logits
+        steps = min(logits.shape[1], token_concept_edges.shape[1])
+        if steps <= 0:
+            return logits
+        concept_conf = torch.sigmoid(concept_logits).unsqueeze(1)
+        active_concepts = token_concept_edges[:, :steps] * concept_conf
+        vocab_bias = torch.matmul(active_concepts, self.concept_token_mask.to(logits.device, logits.dtype))
+        biased = logits.clone()
+        biased[:, :steps] = biased[:, :steps] + self.concept_logit_bias * vocab_bias
+        return biased
+
+    def _step_concept_logit_bias(
+        self,
+        next_logits: torch.Tensor,
+        token_concept: torch.Tensor,
+        concept_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.concept_logit_bias <= 0 or self.concept_token_mask.numel() == 0:
+            return next_logits
+        concept_conf = torch.sigmoid(concept_logits)
+        active_concepts = token_concept * concept_conf
+        vocab_bias = torch.matmul(active_concepts, self.concept_token_mask.to(next_logits.device, next_logits.dtype))
+        return next_logits + self.concept_logit_bias * vocab_bias
 
     def _graph_prefix(
         self,
@@ -468,6 +553,7 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         token_hidden = lm_out.hidden_states[-1][:, self.prefix_length : self.prefix_length + steps]
         rc_seq, token_concept = self._dynamic_edges_from_llm_hidden(token_hidden, region_features, concept_features)
         logits = lm_out.logits[:, self.prefix_length :, :]
+        logits = self._apply_concept_logit_bias(logits, token_concept, concept_logits)
         return DecodeOutput(logits, concept_logits, rc_seq, token_concept, region_features, concept_features, ra_edges, ac_edges, anatomy_features, lm_out.loss)
 
     @torch.no_grad()
@@ -477,6 +563,9 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         start_id = self.bos_id if self.bos_id is not None and self.bos_id >= 0 else self.eos_id
         generated = torch.full((batch, 1), start_id, dtype=torch.long, device=images.device)
         logits_steps = []
+        rc_edges = []
+        token_concept_edges = []
+        concept_logits = self.concept_head(concept_features).squeeze(-1)
         finished = torch.zeros(batch, dtype=torch.bool, device=images.device)
         for _ in range(max_len - 1):
             text_embeds = self.llm.get_input_embeddings()(generated)
@@ -484,17 +573,24 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
             mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=images.device)
             out = self.llm(inputs_embeds=inputs_embeds, attention_mask=mask, output_hidden_states=True, return_dict=True)
             next_logits = out.logits[:, -1, :]
+            step_hidden = out.hidden_states[-1][:, -1:, :]
+            rc_step, token_concept_step = self._dynamic_edges_from_llm_hidden(step_hidden, region_features, concept_features)
+            next_logits = self._step_concept_logit_bias(next_logits, token_concept_step[:, 0], concept_logits)
             next_id = next_logits.argmax(dim=-1)
             next_id = torch.where(finished, torch.full_like(next_id, self.pad_id), next_id)
             generated = torch.cat([generated, next_id[:, None]], dim=1)
             logits_steps.append(next_logits)
+            rc_edges.append(rc_step[:, 0])
+            token_concept_edges.append(token_concept_step[:, 0])
             if self.eos_id is not None:
                 finished |= next_id == self.eos_id
             if bool(finished.all()):
                 break
         gen_tokens = generated[:, 1:]
-        concept_logits = self.concept_head(concept_features).squeeze(-1)
-        if gen_tokens.shape[1] > 0:
+        if rc_edges:
+            rc_seq = torch.stack(rc_edges, dim=1)
+            token_concept = torch.stack(token_concept_edges, dim=1)
+        elif gen_tokens.shape[1] > 0:
             text_embeds = self.llm.get_input_embeddings()(generated[:, :-1])
             inputs_embeds = torch.cat([prefix, text_embeds], dim=1)
             mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=images.device)
@@ -533,8 +629,9 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         use_anatomy: bool = True,
         freeze_llm: bool = False,
         prefix_length: int = 4,
+        concept_logit_bias: float = 0.8,
     ) -> None:
-        from transformers import AutoModelForSeq2SeqLM
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
         fallback_id = next((idx for idx in (pad_id, bos_id, eos_id) if idx is not None and idx >= 0), 0)
         dummy_vocab_size = int(fallback_id) + 8
@@ -556,6 +653,13 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         self.llm_name = llm_name
         self.llm = AutoModelForSeq2SeqLM.from_pretrained(llm_name)
         self.llm_dim = _hf_hidden_size(self.llm.config)
+        self.concept_logit_bias = float(concept_logit_bias)
+        tokenizer = AutoTokenizer.from_pretrained(llm_name)
+        self.register_buffer(
+            "concept_token_mask",
+            _build_concept_token_mask(tokenizer, concept_names, int(self.llm.config.vocab_size)),
+            persistent=False,
+        )
         self.prefix_length = prefix_length
         self.prefix_offset = nn.Parameter(torch.randn(prefix_length, self.llm_dim) * 0.02)
         self.prefix_proj = nn.Sequential(
@@ -573,6 +677,37 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         if freeze_llm:
             for param in self.llm.parameters():
                 param.requires_grad = False
+
+    def _apply_concept_logit_bias(
+        self,
+        logits: torch.Tensor,
+        token_concept_edges: torch.Tensor,
+        concept_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.concept_logit_bias <= 0 or self.concept_token_mask.numel() == 0 or logits.numel() == 0:
+            return logits
+        steps = min(logits.shape[1], token_concept_edges.shape[1])
+        if steps <= 0:
+            return logits
+        concept_conf = torch.sigmoid(concept_logits).unsqueeze(1)
+        active_concepts = token_concept_edges[:, :steps] * concept_conf
+        vocab_bias = torch.matmul(active_concepts, self.concept_token_mask.to(logits.device, logits.dtype))
+        biased = logits.clone()
+        biased[:, :steps] = biased[:, :steps] + self.concept_logit_bias * vocab_bias
+        return biased
+
+    def _step_concept_logit_bias(
+        self,
+        next_logits: torch.Tensor,
+        token_concept: torch.Tensor,
+        concept_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.concept_logit_bias <= 0 or self.concept_token_mask.numel() == 0:
+            return next_logits
+        concept_conf = torch.sigmoid(concept_logits)
+        active_concepts = token_concept * concept_conf
+        vocab_bias = torch.matmul(active_concepts, self.concept_token_mask.to(next_logits.device, next_logits.dtype))
+        return next_logits + self.concept_logit_bias * vocab_bias
 
     def _graph_prefix(
         self,
@@ -661,8 +796,9 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
             concept_features,
         )
         concept_logits = self.concept_head(concept_features).squeeze(-1)
+        logits = self._apply_concept_logit_bias(lm_out.logits, token_concept, concept_logits)
         return DecodeOutput(
-            lm_out.logits,
+            logits,
             concept_logits,
             rc_seq,
             token_concept,
@@ -679,17 +815,33 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         prefix, region_features, ra_edges, ac_edges, anatomy_features, concept_features = self._graph_forward(images)
         batch = images.shape[0]
         encoder_mask = torch.ones(batch, self.prefix_length, dtype=torch.long, device=images.device)
-        raw_tokens = self.llm.generate(
-            inputs_embeds=prefix,
-            attention_mask=encoder_mask,
-            max_new_tokens=max_len,
-            pad_token_id=self.pad_id,
-            eos_token_id=self.eos_id,
-        )
-        if raw_tokens.shape[1] > 0 and bool((raw_tokens[:, 0] == self.decoder_start_id).all()):
-            gen_tokens = raw_tokens[:, 1:]
-        else:
-            gen_tokens = raw_tokens
+        concept_logits = self.concept_head(concept_features).squeeze(-1)
+        decoder_input_ids = torch.full((batch, 1), self.decoder_start_id, dtype=torch.long, device=images.device)
+        generated = []
+        logits_steps = []
+        finished = torch.zeros(batch, dtype=torch.bool, device=images.device)
+        for _ in range(max_len):
+            step_out = self.llm(
+                inputs_embeds=prefix,
+                attention_mask=encoder_mask,
+                decoder_input_ids=decoder_input_ids,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            decoder_hidden = step_out.decoder_hidden_states[-1][:, -1:, :]
+            rc_step, token_concept_step = self._dynamic_edges_from_decoder_hidden(decoder_hidden, region_features, concept_features)
+            next_logits = step_out.logits[:, -1, :]
+            next_logits = self._step_concept_logit_bias(next_logits, token_concept_step[:, 0], concept_logits)
+            next_id = next_logits.argmax(dim=-1)
+            next_id = torch.where(finished, torch.full_like(next_id, self.pad_id), next_id)
+            generated.append(next_id)
+            logits_steps.append(next_logits)
+            decoder_input_ids = torch.cat([decoder_input_ids, next_id[:, None]], dim=1)
+            if self.eos_id is not None:
+                finished |= next_id == self.eos_id
+            if bool(finished.all()):
+                break
+        gen_tokens = torch.stack(generated, dim=1) if generated else torch.empty(batch, 0, dtype=torch.long, device=images.device)
         decoder_input_ids = self._shift_right(gen_tokens)
         lm_out = self.llm(
             inputs_embeds=prefix,
@@ -709,9 +861,12 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         else:
             rc_seq = torch.empty(batch, 0, region_features.shape[1], self.num_concepts, device=images.device)
             token_concept = torch.empty(batch, 0, self.num_concepts, device=images.device)
-        concept_logits = self.concept_head(concept_features).squeeze(-1)
+        if logits_steps:
+            logits = torch.stack(logits_steps, dim=1)
+        else:
+            logits = self._apply_concept_logit_bias(lm_out.logits, token_concept, concept_logits)
         return DecodeOutput(
-            lm_out.logits,
+            logits,
             concept_logits,
             rc_seq,
             token_concept,

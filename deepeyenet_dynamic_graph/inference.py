@@ -68,6 +68,7 @@ def _build_hf_model(cfg: Config, tokenizer, concepts: list[str]):
         cfg.use_anatomy,
         cfg.freeze_llm,
         cfg.prefix_length,
+        cfg.concept_logit_bias,
     )
 
 

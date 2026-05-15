@@ -10,6 +10,7 @@ The original markdown describes a dynamic explanation graph for chest X-ray repo
 - Concept vocabulary built from DeepEyeNet `Keywords`.
 - Dynamic region-to-concept graph updated during decoding.
 - LLM report decoders conditioned on the anatomy-aware explanation graph through learned soft-prefix embeddings, with both decoder-only and encoder-decoder HuggingFace models supported.
+- Graph-guided lexical decoding that raises next-token scores for words attached to high-confidence concept nodes.
 - Optional GRU decoder baseline with `--decoder-type gru`.
 - Multi-task losses for report generation, concept prediction, graph alignment, sparsity, and temporal consistency.
 - Concept coverage loss to reduce generic normal-report collapse by encouraging active findings to appear in the generated report.
@@ -131,6 +132,14 @@ Use encoder-decoder models such as T5/FLAN-T5 with:
 ```
 
 The design choice is deliberate: causal LMs receive the graph as learned soft-prefix tokens before the report, while seq2seq LMs receive the graph as encoder context and generate from the decoder. Both paths return the same explanation tensors, so metrics, counterfactuals, and the interactive HTML viewer remain comparable across decoder families.
+
+The decoder also applies graph-guided lexical bias. At each token position, active concept nodes softly raise the logits of their tokenizer pieces and common aliases. This is meant to reduce generic reports by giving findings such as `pneumothorax`, `pleural effusion`, or `cardiomegaly` a direct route into the generated text while preserving the LLM's fluency. Tune it with:
+
+```bash
+--concept-logit-bias 0.8
+```
+
+Set it to `0` for a pure soft-prefix ablation.
 
 To make outputs less generic, training also includes a lightweight concept coverage objective. For each supervised finding, the model is penalized when the decoder never assigns high probability to the tokenizer pieces for that concept. The strength is controlled by:
 

@@ -28,6 +28,7 @@ class Config:
     llm_name: str = "distilgpt2"
     freeze_llm: bool = False
     prefix_length: int = 4
+    concept_logit_bias: float = 0.8
     graph_steps: int = 1
     use_anatomy: bool = True
     disable_counterfactuals: bool = False

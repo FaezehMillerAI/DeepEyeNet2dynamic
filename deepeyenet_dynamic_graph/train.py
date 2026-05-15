@@ -36,6 +36,7 @@ def parse_args() -> Config:
     parser.add_argument("--llm-name", default="distilgpt2")
     parser.add_argument("--freeze-llm", action="store_true")
     parser.add_argument("--prefix-length", type=int, default=4)
+    parser.add_argument("--concept-logit-bias", type=float, default=0.8)
     parser.add_argument("--graph-steps", type=int, default=1)
     parser.add_argument("--lambda-concept", type=float, default=0.4)
     parser.add_argument("--lambda-align", type=float, default=0.1)
@@ -67,6 +68,7 @@ def parse_args() -> Config:
         llm_name=args.llm_name,
         freeze_llm=args.freeze_llm,
         prefix_length=args.prefix_length,
+        concept_logit_bias=args.concept_logit_bias,
         graph_steps=args.graph_steps,
         lambda_concept=args.lambda_concept,
         lambda_align=args.lambda_align,
@@ -128,6 +130,7 @@ def _build_hf_model(cfg: Config, tokenizer, concepts: list[str]):
         cfg.use_anatomy,
         cfg.freeze_llm,
         cfg.prefix_length,
+        cfg.concept_logit_bias,
     )
 
 
