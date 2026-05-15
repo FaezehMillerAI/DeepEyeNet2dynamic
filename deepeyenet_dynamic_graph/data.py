@@ -442,8 +442,14 @@ class MedicalReportDataset(Dataset):
         self.vocab = vocab
         self.concepts = concepts
         self.concept_to_idx = {c: i for i, c in enumerate(concepts)}
+        self.concept_token_ids = {c: self._concept_token_ids(c) for c in concepts}
         self.max_report_len = max_report_len
         self.transform = make_transforms(image_size, train=split == "train")
+
+    def _concept_token_ids(self, concept: str) -> list[int]:
+        ids = self.vocab.encode(concept, max_len=max(2, min(12, self.max_report_len)))
+        special = {self.vocab.pad_id, self.vocab.bos_id, self.vocab.eos_id, self.vocab.unk_id}
+        return [idx for idx in ids if idx not in special]
 
     def __len__(self) -> int:
         return len(self.records)
@@ -456,14 +462,18 @@ class MedicalReportDataset(Dataset):
 
         token_ids = self.vocab.encode(rec["report_text"], self.max_report_len)
         concept_targets = torch.zeros(len(self.concepts), dtype=torch.float32)
+        coverage_token_ids: list[int] = []
         for kw in rec["keywords"]:
             concept = normalize_concept(kw)
             if concept in self.concept_to_idx:
                 concept_targets[self.concept_to_idx[concept]] = 1.0
+                coverage_token_ids.extend(self.concept_token_ids.get(concept, []))
+        coverage_token_ids = sorted(set(coverage_token_ids))[:32]
 
         return {
             "image": image,
             "tokens": torch.tensor(token_ids, dtype=torch.long),
+            "coverage_token_ids": torch.tensor(coverage_token_ids, dtype=torch.long),
             "concept_targets": concept_targets,
             "image_path": rec["image_path"],
             "report_text": rec["report_text"],
@@ -494,8 +504,23 @@ class HFMedicalReportDataset(Dataset):
         self.tokenizer = tokenizer
         self.concepts = concepts
         self.concept_to_idx = {c: i for i, c in enumerate(concepts)}
+        self.concept_token_ids = {c: self._concept_token_ids(c) for c in concepts}
         self.max_report_len = max_report_len
         self.transform = make_transforms(image_size, train=split == "train")
+
+    def _concept_token_ids(self, concept: str) -> list[int]:
+        ids = self.tokenizer(concept, add_special_tokens=False).get("input_ids", [])
+        special = {
+            idx
+            for idx in [
+                self.tokenizer.pad_token_id,
+                self.tokenizer.bos_token_id,
+                self.tokenizer.eos_token_id,
+                self.tokenizer.unk_token_id,
+            ]
+            if idx is not None
+        }
+        return [int(idx) for idx in ids if int(idx) not in special]
 
     def __len__(self) -> int:
         return len(self.records)
@@ -518,13 +543,17 @@ class HFMedicalReportDataset(Dataset):
         if self.tokenizer.eos_token_id is not None and (not input_ids or input_ids[-1] != self.tokenizer.eos_token_id):
             input_ids = input_ids[: self.max_report_len - 1] + [self.tokenizer.eos_token_id]
         concept_targets = torch.zeros(len(self.concepts), dtype=torch.float32)
+        coverage_token_ids: list[int] = []
         for kw in rec["keywords"]:
             concept = normalize_concept(kw)
             if concept in self.concept_to_idx:
                 concept_targets[self.concept_to_idx[concept]] = 1.0
+                coverage_token_ids.extend(self.concept_token_ids.get(concept, []))
+        coverage_token_ids = sorted(set(coverage_token_ids))[:32]
         return {
             "image": image,
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "coverage_token_ids": torch.tensor(coverage_token_ids, dtype=torch.long),
             "concept_targets": concept_targets,
             "image_path": rec["image_path"],
             "report_text": rec["report_text"],
@@ -536,13 +565,18 @@ def collate_fn(batch: list[dict[str, Any]], pad_id: int) -> dict[str, Any]:
     images = torch.stack([item["image"] for item in batch])
     concept_targets = torch.stack([item["concept_targets"] for item in batch])
     max_len = max(item["tokens"].numel() for item in batch)
+    max_coverage_len = max([item["coverage_token_ids"].numel() for item in batch] + [0])
     tokens = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
+    coverage_token_ids = torch.full((len(batch), max_coverage_len), -1, dtype=torch.long)
     lengths = torch.tensor([item["tokens"].numel() for item in batch], dtype=torch.long)
     for i, item in enumerate(batch):
         tokens[i, : item["tokens"].numel()] = item["tokens"]
+        if item["coverage_token_ids"].numel():
+            coverage_token_ids[i, : item["coverage_token_ids"].numel()] = item["coverage_token_ids"]
     return {
         "image": images,
         "tokens": tokens,
+        "coverage_token_ids": coverage_token_ids,
         "lengths": lengths,
         "concept_targets": concept_targets,
         "image_path": [item["image_path"] for item in batch],
@@ -555,16 +589,21 @@ def collate_hf_fn(batch: list[dict[str, Any]], pad_id: int) -> dict[str, Any]:
     images = torch.stack([item["image"] for item in batch])
     concept_targets = torch.stack([item["concept_targets"] for item in batch])
     max_len = max(item["input_ids"].numel() for item in batch)
+    max_coverage_len = max([item["coverage_token_ids"].numel() for item in batch] + [0])
     input_ids = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
     attention_mask = torch.zeros((len(batch), max_len), dtype=torch.long)
+    coverage_token_ids = torch.full((len(batch), max_coverage_len), -1, dtype=torch.long)
     for i, item in enumerate(batch):
         length = item["input_ids"].numel()
         input_ids[i, :length] = item["input_ids"]
         attention_mask[i, :length] = 1
+        if item["coverage_token_ids"].numel():
+            coverage_token_ids[i, : item["coverage_token_ids"].numel()] = item["coverage_token_ids"]
     return {
         "image": images,
         "tokens": input_ids,
         "attention_mask": attention_mask,
+        "coverage_token_ids": coverage_token_ids,
         "lengths": attention_mask.sum(dim=1),
         "concept_targets": concept_targets,
         "image_path": [item["image_path"] for item in batch],

@@ -12,6 +12,7 @@ The original markdown describes a dynamic explanation graph for chest X-ray repo
 - LLM report decoders conditioned on the anatomy-aware explanation graph through learned soft-prefix embeddings, with both decoder-only and encoder-decoder HuggingFace models supported.
 - Optional GRU decoder baseline with `--decoder-type gru`.
 - Multi-task losses for report generation, concept prediction, graph alignment, sparsity, and temporal consistency.
+- Concept coverage loss to reduce generic normal-report collapse by encouraging active findings to appear in the generated report.
 - Evaluation suite for text quality, clinical concept fidelity, graph behavior, evidence faithfulness, and counterfactual sensitivity.
 - Publication-oriented visualizations: metric bars, confusion heatmaps, graph diagrams, evidence heatmaps, counterfactual curves, and an interactive hover explanation viewer.
 - A Colab notebook scaffold in `notebooks/DeepEyeNet_Dynamic_Graph_Colab.ipynb`.
@@ -130,6 +131,14 @@ Use encoder-decoder models such as T5/FLAN-T5 with:
 ```
 
 The design choice is deliberate: causal LMs receive the graph as learned soft-prefix tokens before the report, while seq2seq LMs receive the graph as encoder context and generate from the decoder. Both paths return the same explanation tensors, so metrics, counterfactuals, and the interactive HTML viewer remain comparable across decoder families.
+
+To make outputs less generic, training also includes a lightweight concept coverage objective. For each supervised finding, the model is penalized when the decoder never assigns high probability to the tokenizer pieces for that concept. The strength is controlled by:
+
+```bash
+--lambda-coverage 0.05
+```
+
+Evaluation reports `report_concept_mention_recall`, `report_concept_mention_precision`, `report_concept_mention_f1`, and `important_concept_omission_rate`, which are useful for catching cases where the generated report says only “no acute disease” while omitting important findings such as pneumothorax or pleural effusion.
 
 ## Concept Graphs
 

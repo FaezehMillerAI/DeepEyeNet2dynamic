@@ -288,8 +288,10 @@ def compute_losses(
     target_tokens: torch.Tensor,
     concept_targets: torch.Tensor,
     pad_id: int,
+    coverage_token_ids: torch.Tensor | None = None,
     lambda_concept: float = 0.4,
     lambda_align: float = 0.1,
+    lambda_coverage: float = 0.05,
     lambda_sparse: float = 0.01,
     lambda_temp: float = 0.05,
 ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -301,18 +303,34 @@ def compute_losses(
     concept_loss = F.binary_cross_entropy_with_logits(output.concept_logits, concept_targets)
     graph_readout = output.token_concept_edges.max(dim=1).values.clamp(1e-4, 1 - 1e-4)
     align_loss = F.binary_cross_entropy(graph_readout, concept_targets)
+    coverage_loss = torch.tensor(0.0, device=target_tokens.device)
+    if coverage_token_ids is not None and coverage_token_ids.numel() and output.logits.numel():
+        log_probs = F.log_softmax(output.logits, dim=-1)
+        sample_losses = []
+        vocab_size = output.logits.shape[-1]
+        for b in range(log_probs.shape[0]):
+            ids = coverage_token_ids[b]
+            ids = ids[(ids >= 0) & (ids < vocab_size)]
+            if ids.numel() == 0:
+                continue
+            ids = torch.unique(ids)
+            best_log_probs = log_probs[b, :, ids].max(dim=0).values
+            sample_losses.append(-best_log_probs.mean())
+        if sample_losses:
+            coverage_loss = torch.stack(sample_losses).mean()
     edge_probs = output.token_concept_edges.clamp_min(1e-8)
     sparse_loss = -(edge_probs * edge_probs.log()).sum(dim=-1).mean()
     temp_loss = torch.tensor(0.0, device=target_tokens.device)
     if output.rc_edges.shape[1] > 2:
         first_diff = output.rc_edges[:, 1:] - output.rc_edges[:, :-1]
         temp_loss = (first_diff[:, 1:] - first_diff[:, :-1]).abs().mean()
-    total = rep_loss + lambda_concept * concept_loss + lambda_align * align_loss + lambda_sparse * sparse_loss + lambda_temp * temp_loss
+    total = rep_loss + lambda_concept * concept_loss + lambda_align * align_loss + lambda_coverage * coverage_loss + lambda_sparse * sparse_loss + lambda_temp * temp_loss
     return total, {
         "loss": float(total.detach().cpu()),
         "rep_loss": float(rep_loss.detach().cpu()),
         "concept_loss": float(concept_loss.detach().cpu()),
         "align_loss": float(align_loss.detach().cpu()),
+        "coverage_loss": float(coverage_loss.detach().cpu()),
         "sparse_loss": float(sparse_loss.detach().cpu()),
         "temp_loss": float(temp_loss.detach().cpu()),
     }

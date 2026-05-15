@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from .config import Config
 from .data import HFMedicalReportDataset, MedicalReportDataset, anatomy_prior_matrix, collate_fn, collate_hf_fn, get_anatomy_names
-from .metrics import concept_metrics, graph_metrics, language_metrics
+from .metrics import concept_metrics, graph_metrics, language_metrics, report_concept_mention_metrics
 from .model import DynamicGraphCaptioner, GraphPrefixLLMCaptioner, GraphSeq2SeqCaptioner
 from .utils import ensure_dir, get_device, load_json, save_json
 from .visualize import (
@@ -228,6 +228,7 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
     metrics = {}
     metrics.update(language_metrics(references, hypotheses))
     metrics.update(concept_metrics(y_true, y_prob))
+    metrics.update(report_concept_mention_metrics(concepts, y_true, hypotheses))
     metrics.update(graph_metrics(rc, tc, y_true, topk=cfg.topk_evidence, temporal_drifts=np.asarray(temporal_drifts)))
     metrics["patch_counterfactual_drop_mean"] = float(np.mean(patch_drops)) if patch_drops else 0.0
     metrics["patch_counterfactual_drop_median"] = float(np.median(patch_drops)) if patch_drops else 0.0

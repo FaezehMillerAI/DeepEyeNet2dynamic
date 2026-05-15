@@ -41,6 +41,7 @@ class Config:
     seed: int = 42
     lambda_concept: float = 0.4
     lambda_align: float = 0.1
+    lambda_coverage: float = 0.05
     lambda_sparse: float = 0.01
     lambda_temp: float = 0.05
     grad_clip: float = 1.0

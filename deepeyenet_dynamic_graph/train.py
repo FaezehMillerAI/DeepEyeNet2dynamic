@@ -39,6 +39,7 @@ def parse_args() -> Config:
     parser.add_argument("--graph-steps", type=int, default=1)
     parser.add_argument("--lambda-concept", type=float, default=0.4)
     parser.add_argument("--lambda-align", type=float, default=0.1)
+    parser.add_argument("--lambda-coverage", type=float, default=0.05)
     parser.add_argument("--lambda-sparse", type=float, default=0.01)
     parser.add_argument("--lambda-temp", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -69,6 +70,7 @@ def parse_args() -> Config:
         graph_steps=args.graph_steps,
         lambda_concept=args.lambda_concept,
         lambda_align=args.lambda_align,
+        lambda_coverage=args.lambda_coverage,
         lambda_sparse=args.lambda_sparse,
         lambda_temp=args.lambda_temp,
         num_workers=args.num_workers,
@@ -141,6 +143,9 @@ def run_epoch(model, loader, optimizer, cfg: Config, device: torch.device, train
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
         concept_targets = batch["concept_targets"].to(device)
+        coverage_token_ids = batch.get("coverage_token_ids")
+        if coverage_token_ids is not None:
+            coverage_token_ids = coverage_token_ids.to(device)
         with torch.set_grad_enabled(train):
             if attention_mask is not None:
                 output = model(images, tokens, attention_mask=attention_mask)
@@ -151,8 +156,10 @@ def run_epoch(model, loader, optimizer, cfg: Config, device: torch.device, train
                 tokens,
                 concept_targets,
                 model.pad_id,
+                coverage_token_ids,
                 cfg.lambda_concept,
                 cfg.lambda_align,
+                cfg.lambda_coverage,
                 cfg.lambda_sparse,
                 cfg.lambda_temp,
             )
