@@ -12,6 +12,7 @@ from .config import Config
 from .concept_graph import build_concept_graph
 from .data import HFMedicalReportDataset, MedicalReportDataset, anatomy_prior_matrix, build_artifacts, collate_fn, collate_hf_fn, get_anatomy_names, load_split_records
 from .model import DynamicGraphCaptioner, GraphPrefixLLMCaptioner, GraphSeq2SeqCaptioner, compute_losses
+from .report_memory import save_report_memory
 from .utils import ensure_dir, get_device, save_json, set_seed
 from .vocab import build_concepts
 
@@ -50,6 +51,9 @@ def parse_args() -> Config:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--no-anatomy", action="store_true")
     parser.add_argument("--disable-counterfactuals", action="store_true")
+    parser.add_argument("--no-report-memory", action="store_true")
+    parser.add_argument("--report-memory-max-entries", type=int, default=2500)
+    parser.add_argument("--report-memory-min-score", type=float, default=0.05)
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
     cfg = Config(
@@ -85,6 +89,9 @@ def parse_args() -> Config:
         grad_clip=args.grad_clip,
         use_anatomy=not args.no_anatomy,
         disable_counterfactuals=args.disable_counterfactuals,
+        use_report_memory=not args.no_report_memory,
+        report_memory_max_entries=args.report_memory_max_entries,
+        report_memory_min_score=args.report_memory_min_score,
         device=args.device,
     )
     return cfg
@@ -286,6 +293,8 @@ def main() -> None:
         save_json(vocab.to_dict(), out_dir / "vocab.json")
     save_json({"concepts": concepts}, out_dir / "concepts.json")
     save_json(concept_graph, out_dir / "concept_graph.json")
+    if cfg.use_report_memory:
+        save_report_memory(train_records, out_dir / "report_memory.json", max_entries=cfg.report_memory_max_entries)
     cfg.save(out_dir / "config.json")
 
     if _uses_hf_decoder(cfg):

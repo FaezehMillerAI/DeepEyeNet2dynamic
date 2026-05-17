@@ -11,6 +11,7 @@ The original markdown describes a dynamic explanation graph for chest X-ray repo
 - Dynamic region-to-concept graph updated during decoding.
 - LLM report decoders conditioned on the anatomy-aware explanation graph through learned soft-prefix embeddings, with both decoder-only and encoder-decoder HuggingFace models supported.
 - Graph-guided lexical decoding that raises next-token scores for words attached to high-confidence concept nodes.
+- Optional graph-conditioned report memory for retrieve-and-generate decoding, useful for improving n-gram metrics while keeping raw model outputs available.
 - Optional GRU decoder baseline with `--decoder-type gru`.
 - Multi-task losses for report generation, concept prediction, graph alignment, sparsity, and temporal consistency.
 - Concept coverage loss to reduce generic normal-report collapse by encouraging active findings to appear in the generated report.
@@ -148,6 +149,18 @@ To make outputs less generic, training also includes a lightweight concept cover
 ```
 
 Evaluation reports `report_concept_mention_recall`, `report_concept_mention_precision`, `report_concept_mention_f1`, and `important_concept_omission_rate`, which are useful for catching cases where the generated report says only “no acute disease” while omitting important findings such as pneumothorax or pleural effusion.
+
+For stronger report-generation metrics, training saves a `report_memory.json` built from the training reports. During evaluation/inference, the model can retrieve the closest training report template from predicted graph concepts and use it as the final report. Raw decoder outputs are still saved with the `raw_` metric prefix for ablations.
+
+```bash
+--report-memory-min-score 0.05
+```
+
+Disable this retrieve-and-generate layer with:
+
+```bash
+--no-report-memory
+```
 
 ## Concept Graphs
 

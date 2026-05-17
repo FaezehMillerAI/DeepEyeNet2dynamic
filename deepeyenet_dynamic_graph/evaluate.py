@@ -15,6 +15,7 @@ from .config import Config
 from .data import HFMedicalReportDataset, MedicalReportDataset, anatomy_prior_matrix, collate_fn, collate_hf_fn, get_anatomy_names
 from .metrics import concept_metrics, graph_metrics, language_metrics, report_concept_mention_metrics
 from .model import DynamicGraphCaptioner, GraphPrefixLLMCaptioner, GraphSeq2SeqCaptioner
+from .report_memory import concept_set_from_probs, load_report_memory, retrieve_report
 from .utils import ensure_dir, get_device, load_json, save_json
 from .visualize import (
     plot_concept_confusion,
@@ -39,6 +40,7 @@ def parse_args():
     parser.add_argument("--max-report-len", type=int, default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--no-counterfactuals", action="store_true")
+    parser.add_argument("--no-report-memory", action="store_true")
     parser.add_argument("--max-interactive-examples", type=int, default=None)
     return parser.parse_args()
 
@@ -215,6 +217,10 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
     anatomy_drops = []
     finding_drops = []
     examples = []
+    memory = load_report_memory(Path(cfg.output_dir) / "report_memory.json") if cfg.use_report_memory else []
+    raw_hypotheses = []
+    retrieval_scores = []
+    retrieval_used = []
 
     for batch in tqdm(loader, desc="evaluate"):
         images = batch["image"].to(device)
@@ -227,11 +233,22 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
             teacher_output = model(images, tokens, attention_mask=attention_mask)
         else:
             teacher_output = model(images, tokens)
-        pred_texts = [_decode_text(text_decoder, row.tolist()) for row in gen_tokens.cpu()]
-        references.extend(batch["report_text"])
-        hypotheses.extend(pred_texts)
+        raw_pred_texts = [_decode_text(text_decoder, row.tolist()) for row in gen_tokens.cpu()]
 
         probs = torch.sigmoid(teacher_output.concept_logits)
+        pred_texts = []
+        for i, raw_text in enumerate(raw_pred_texts):
+            retrieved = None
+            score = 0.0
+            if memory:
+                query = concept_set_from_probs(concepts, probs[i].detach().cpu(), threshold=0.35, top_k=5)
+                retrieved, score = retrieve_report(memory, query, min_score=cfg.report_memory_min_score)
+            pred_texts.append(retrieved or raw_text)
+            retrieval_scores.append(float(score))
+            retrieval_used.append(bool(retrieved))
+        references.extend(batch["report_text"])
+        hypotheses.extend(pred_texts)
+        raw_hypotheses.extend(raw_pred_texts)
         all_true.append(batch["concept_targets"].numpy())
         all_prob.append(probs.cpu().numpy())
         all_rc.append(teacher_output.rc_edges.mean(dim=1).cpu().numpy())
@@ -269,6 +286,7 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
                     "image_path": batch["image_path"][i],
                     "reference": batch["report_text"][i],
                     "prediction": pred_texts[i],
+                    "raw_prediction": raw_pred_texts[i],
                     "keywords": batch["keywords"][i],
                     "concept_prob": probs[i].cpu().numpy(),
                     "rc_edges": teacher_output.rc_edges[i].cpu().numpy(),
@@ -288,6 +306,8 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
     tc = np.concatenate(all_tc, axis=0)
     metrics = {}
     metrics.update(language_metrics(references, hypotheses))
+    raw_language = language_metrics(references, raw_hypotheses)
+    metrics.update({f"raw_{key}": val for key, val in raw_language.items()})
     metrics.update(concept_metrics(y_true, y_prob))
     metrics.update(report_concept_mention_metrics(concepts, y_true, hypotheses))
     metrics.update(graph_metrics(rc, tc, y_true, topk=cfg.topk_evidence, temporal_drifts=np.asarray(temporal_drifts)))
@@ -298,10 +318,12 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
     metrics["anatomy_counterfactual_positive_rate"] = float(np.mean(np.asarray(anatomy_drops) > 0)) if anatomy_drops else 0.0
     metrics["finding_counterfactual_drop_mean"] = float(np.mean(finding_drops)) if finding_drops else 0.0
     metrics["finding_counterfactual_positive_rate"] = float(np.mean(np.asarray(finding_drops) > 0)) if finding_drops else 0.0
+    metrics["report_memory_used_rate"] = float(np.mean(retrieval_used)) if retrieval_used else 0.0
+    metrics["report_memory_score_mean"] = float(np.mean(retrieval_scores)) if retrieval_scores else 0.0
 
     save_json(metrics, output_dir / "metrics.json")
     save_json(
-        [{"reference": r, "prediction": h} for r, h in zip(references, hypotheses)],
+        [{"reference": r, "prediction": h, "raw_prediction": raw} for r, h, raw in zip(references, hypotheses, raw_hypotheses)],
         output_dir / "generated_reports.json",
     )
     plot_metric_bars(metrics, output_dir / "metric_summary.png")
@@ -405,6 +427,8 @@ def main() -> None:
         cfg.max_report_len = args.max_report_len
     if args.no_counterfactuals:
         cfg.disable_counterfactuals = True
+    if args.no_report_memory:
+        cfg.use_report_memory = False
     if args.max_interactive_examples is not None:
         cfg.max_interactive_examples = args.max_interactive_examples
     output_dir = ensure_dir(args.output_dir)

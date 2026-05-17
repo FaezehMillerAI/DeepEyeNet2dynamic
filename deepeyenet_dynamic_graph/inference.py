@@ -9,6 +9,7 @@ from PIL import Image
 from .config import Config
 from .data import anatomy_prior_matrix, get_anatomy_names, make_transforms
 from .model import DynamicGraphCaptioner, GraphPrefixLLMCaptioner, GraphSeq2SeqCaptioner
+from .report_memory import concept_set_from_probs, load_report_memory, retrieve_report
 from .utils import get_device, load_json
 from .vocab import Vocabulary
 
@@ -18,6 +19,7 @@ def parse_args():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--image", required=True)
     parser.add_argument("--max-report-len", type=int, default=96)
+    parser.add_argument("--no-report-memory", action="store_true")
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
 
@@ -99,6 +101,8 @@ def main() -> None:
     if not (run_dir / "tokenizer_config.json").exists() and not (run_dir / "tokenizer.json").exists() and (run_dir / "vocab.json").exists():
         cfg.decoder_type = "gru"
     cfg.device = args.device
+    if args.no_report_memory:
+        cfg.use_report_memory = False
     concepts = load_json(run_dir / "concepts.json")["concepts"]
     concept_graph_path = run_dir / "concept_graph.json"
     concept_graph = load_json(concept_graph_path) if concept_graph_path.exists() else None
@@ -141,9 +145,20 @@ def main() -> None:
     else:
         report = decoder.decode(gen_tokens[0].cpu().tolist(), skip_special_tokens=True)
     concept_probs = torch.sigmoid(output.concept_logits[0]).cpu()
+    raw_report = report
+    if cfg.use_report_memory:
+        memory = load_report_memory(run_dir / "report_memory.json")
+        query = concept_set_from_probs(concepts, concept_probs, threshold=0.35, top_k=5)
+        retrieved, score = retrieve_report(memory, query, min_score=cfg.report_memory_min_score)
+        if retrieved:
+            report = retrieved
+            print(f"Report memory used: score={score:.3f}")
     top = torch.topk(concept_probs, k=min(8, len(concepts)))
     print("Generated report:")
     print(report)
+    if report != raw_report:
+        print("\nRaw model report:")
+        print(raw_report)
     print("\nTop concepts:")
     for score, idx in zip(top.values.tolist(), top.indices.tolist()):
         print(f"{concepts[idx]}: {score:.3f}")

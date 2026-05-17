@@ -36,6 +36,9 @@ class Config:
     use_anatomy: bool = True
     disable_counterfactuals: bool = False
     max_interactive_examples: int = 12
+    use_report_memory: bool = True
+    report_memory_max_entries: int = 2500
+    report_memory_min_score: float = 0.05
     dropout: float = 0.2
     batch_size: int = 8
     epochs: int = 15
