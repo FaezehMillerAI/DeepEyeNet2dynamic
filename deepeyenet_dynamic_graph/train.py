@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import functools
 from pathlib import Path
 
@@ -166,11 +167,68 @@ def _build_hf_model(cfg: Config, tokenizer, concepts: list[str], concept_graph: 
     )
 
 
-def run_epoch(model, loader, optimizer, cfg: Config, device: torch.device, train: bool) -> dict[str, float]:
+def _progress_postfix(totals: dict[str, float], n: int) -> dict[str, str]:
+    keys = ["loss", "rep_loss", "concept_loss", "align_loss", "coverage_loss"]
+    return {key.replace("_loss", ""): f"{totals[key] / max(1, n):.4f}" for key in keys if key in totals}
+
+
+def _write_history_csv(history: list[dict[str, float]], out_dir: Path) -> None:
+    if not history:
+        return
+    keys = ["epoch"]
+    for row in history:
+        for key in row:
+            if key not in keys:
+                keys.append(key)
+    with (out_dir / "training_progress.csv").open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(history)
+
+
+def _plot_history(history: list[dict[str, float]], out_dir: Path) -> None:
+    if not history:
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+
+    epochs = [row["epoch"] for row in history]
+    panels = [
+        ("Total Loss", ["train_loss", "valid_loss"]),
+        ("Report Loss", ["train_rep_loss", "valid_rep_loss"]),
+        ("Concept/Alignment", ["train_concept_loss", "valid_concept_loss", "train_align_loss", "valid_align_loss"]),
+        ("Coverage/Sparsity", ["train_coverage_loss", "valid_coverage_loss", "train_sparse_loss", "valid_sparse_loss"]),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    for ax, (title, keys) in zip(axes.ravel(), panels):
+        plotted = False
+        for key in keys:
+            vals = [row.get(key) for row in history]
+            if all(v is None for v in vals):
+                continue
+            ax.plot(epochs, vals, marker="o", linewidth=2, label=key)
+            plotted = True
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.grid(True, alpha=0.25)
+        if plotted:
+            ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_dir / "training_progress.png", dpi=160)
+    plt.close(fig)
+
+
+def run_epoch(model, loader, optimizer, cfg: Config, device: torch.device, train: bool, epoch: int) -> dict[str, float]:
     model.train(train)
     totals: dict[str, float] = {}
     n = 0
-    iterator = tqdm(loader, desc="train" if train else "valid", leave=False)
+    stage = "train" if train else "valid"
+    iterator = tqdm(loader, desc=f"{stage} {epoch}/{cfg.epochs}", leave=True, dynamic_ncols=True, smoothing=0.05)
     for batch in iterator:
         images = batch["image"].to(device)
         tokens = batch["tokens"].to(device)
@@ -207,7 +265,7 @@ def run_epoch(model, loader, optimizer, cfg: Config, device: torch.device, train
         n += bs
         for key, val in parts.items():
             totals[key] = totals.get(key, 0.0) + val * bs
-        iterator.set_postfix(loss=parts["loss"])
+        iterator.set_postfix(_progress_postfix(totals, n))
     return {k: v / max(1, n) for k, v in totals.items()}
 
 
@@ -216,6 +274,9 @@ def main() -> None:
     set_seed(cfg.seed)
     out_dir = ensure_dir(cfg.output_dir)
     device = get_device(cfg.device)
+    tqdm.write(f"Output directory: {out_dir}")
+    tqdm.write(f"Device: {device}")
+    tqdm.write(f"Dataset: {cfg.dataset} | decoder: {cfg.decoder_type} | LLM: {cfg.llm_name}")
     if _uses_hf_decoder(cfg):
         from transformers import AutoTokenizer
 
@@ -308,6 +369,9 @@ def main() -> None:
         collate = functools.partial(collate_fn, pad_id=vocab.pad_id)
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, collate_fn=collate)
     valid_loader = DataLoader(valid_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=collate)
+    tqdm.write(f"Train examples: {len(train_ds):,} | valid examples: {len(valid_ds):,}")
+    tqdm.write(f"Train batches: {len(train_loader):,} | valid batches: {len(valid_loader):,}")
+    tqdm.write("Live progress: batch bars show rolling epoch averages. Artifacts update after each epoch.")
 
     if _uses_hf_decoder(cfg):
         model = _build_hf_model(cfg, tokenizer, concepts, concept_graph).to(device)
@@ -332,18 +396,31 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     best = float("inf")
     history = []
-    for epoch in range(1, cfg.epochs + 1):
-        train_metrics = run_epoch(model, train_loader, optimizer, cfg, device, train=True)
-        valid_metrics = run_epoch(model, valid_loader, optimizer, cfg, device, train=False)
+    epoch_bar = tqdm(range(1, cfg.epochs + 1), desc="epochs", dynamic_ncols=True)
+    for epoch in epoch_bar:
+        train_metrics = run_epoch(model, train_loader, optimizer, cfg, device, train=True, epoch=epoch)
+        valid_metrics = run_epoch(model, valid_loader, optimizer, cfg, device, train=False, epoch=epoch)
         row = {"epoch": epoch, **{f"train_{k}": v for k, v in train_metrics.items()}, **{f"valid_{k}": v for k, v in valid_metrics.items()}}
         history.append(row)
         save_json(history, out_dir / "history.json")
-        print(row)
+        _write_history_csv(history, out_dir)
+        _plot_history(history, out_dir)
+        summary = (
+            f"epoch {epoch}/{cfg.epochs} "
+            f"train_loss={train_metrics.get('loss', float('nan')):.4f} "
+            f"valid_loss={valid_metrics.get('loss', float('nan')):.4f} "
+            f"valid_rep={valid_metrics.get('rep_loss', float('nan')):.4f}"
+        )
+        tqdm.write(summary)
         if valid_metrics["loss"] < best:
             best = valid_metrics["loss"]
             torch.save({"model": model.state_dict(), "config": cfg.to_dict()}, out_dir / "best_model.pt")
+            tqdm.write(f"New best validation loss: {best:.4f}; checkpoint saved.")
+        epoch_bar.set_postfix(best=f"{best:.4f}", valid=f"{valid_metrics['loss']:.4f}")
     print(f"Best validation loss: {best:.4f}")
     print(f"Saved checkpoint to {Path(out_dir) / 'best_model.pt'}")
+    print(f"Saved training plot to {Path(out_dir) / 'training_progress.png'}")
+    print(f"Saved training CSV to {Path(out_dir) / 'training_progress.csv'}")
 
 
 if __name__ == "__main__":
