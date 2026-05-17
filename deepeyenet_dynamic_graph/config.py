@@ -25,6 +25,10 @@ class Config:
     relation_extractor: str = "rules"
     relation_extractor_model: str = "gpt-4o-mini"
     relation_prior_weight: float = 1.0
+    vision_encoder_type: str = "cnn"
+    vision_encoder_name: str | None = None
+    vision_checkpoint: str | None = None
+    freeze_vision_encoder: bool = False
     embed_dim: int = 256
     hidden_dim: int = 256
     decoder_type: str = "llm"

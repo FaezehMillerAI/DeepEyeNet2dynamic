@@ -113,6 +113,175 @@ class RegionEncoder(nn.Module):
         return torch.tensor(ids, device=device, dtype=torch.long)
 
 
+class PretrainedVisionRegionEncoder(nn.Module):
+    """Region encoder backed by a pretrained image model.
+
+    Supported modes:
+    - ``cnn``: the local lightweight CNN.
+    - ``hf``: HuggingFace vision models that accept ``pixel_values``.
+    - ``torchvision`` / ``radimagenet``: torchvision CNNs, optionally loaded
+      from a RadImageNet-style checkpoint path.
+    - ``biomedclip``: OpenCLIP/BiomedCLIP image tower. If patch tokens are not
+      exposed by the model, the global image feature is repeated over regions.
+    """
+
+    BIOMEDVLP_TEXT_ENCODER = "microsoft/BiomedVLP-CXR-BERT-specialized"
+    BIOMEDCLIP_IMAGE_ENCODER = "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+
+    def __init__(
+        self,
+        embed_dim: int,
+        patch_grid: int = 4,
+        dropout: float = 0.2,
+        encoder_type: str = "cnn",
+        encoder_name: str | None = None,
+        checkpoint_path: str | None = None,
+        freeze: bool = False,
+    ) -> None:
+        super().__init__()
+        self.encoder_type = (encoder_type or "cnn").lower()
+        self.encoder_name = encoder_name
+        self.patch_grid = patch_grid
+        self.num_regions = patch_grid * patch_grid
+        self.dropout = nn.Dropout(dropout)
+        self.pos_embed = nn.Parameter(torch.randn(self.num_regions, embed_dim) * 0.02)
+        self.quadrant_embed = nn.Embedding(4, embed_dim)
+        nn.init.normal_(self.quadrant_embed.weight, std=0.02)
+        self.backbone = None
+        self.visual = None
+        self.output_proj: nn.Module
+
+        if self.encoder_type == "cnn":
+            self.local_encoder = RegionEncoder(embed_dim, patch_grid=patch_grid, dropout=dropout)
+            self.output_proj = nn.Identity()
+            return
+
+        self.local_encoder = None
+        if self.encoder_type in {"torchvision", "radimagenet"}:
+            self.backbone, out_dim = self._build_torchvision_backbone(encoder_name or "resnet50", checkpoint_path)
+        elif self.encoder_type == "hf":
+            self.backbone, out_dim = self._build_hf_backbone(encoder_name or "google/vit-base-patch16-224")
+        elif self.encoder_type == "biomedclip":
+            self.backbone, out_dim = self._build_biomedclip_backbone(encoder_name or self.BIOMEDCLIP_IMAGE_ENCODER)
+        else:
+            raise ValueError(f"Unknown vision encoder type '{encoder_type}'. Use cnn, hf, torchvision, radimagenet, or biomedclip.")
+        self.output_proj = nn.Linear(out_dim, embed_dim)
+        if freeze:
+            for param in self.parameters():
+                param.requires_grad = False
+            self.output_proj.requires_grad_(True)
+            self.pos_embed.requires_grad_(True)
+            self.quadrant_embed.requires_grad_(True)
+
+    def _build_torchvision_backbone(self, name: str, checkpoint_path: str | None) -> tuple[nn.Module, int]:
+        import torchvision.models as models
+
+        if not hasattr(models, name):
+            raise ValueError(f"torchvision has no model named '{name}'. Try resnet50, densenet121, or efficientnet_b0.")
+        model_fn = getattr(models, name)
+        model = model_fn(weights=None)
+        if checkpoint_path:
+            state = torch.load(checkpoint_path, map_location="cpu")
+            state = state.get("state_dict", state.get("model", state)) if isinstance(state, dict) else state
+            cleaned = {str(k).replace("module.", "").replace("backbone.", ""): v for k, v in state.items()}
+            model.load_state_dict(cleaned, strict=False)
+        if name.startswith("resnet") or name.startswith("resnext") or name.startswith("wide_resnet"):
+            out_dim = int(model.fc.in_features)
+            backbone = nn.Sequential(*list(model.children())[:-2])
+        elif name.startswith("densenet"):
+            out_dim = int(model.classifier.in_features)
+            backbone = model.features
+        elif name.startswith("efficientnet"):
+            out_dim = int(model.classifier[-1].in_features)
+            backbone = model.features
+        else:
+            raise ValueError(f"Model '{name}' is not yet supported for spatial feature extraction.")
+        return backbone, out_dim
+
+    def _build_hf_backbone(self, name: str) -> tuple[nn.Module, int]:
+        from transformers import AutoModel
+
+        if name == self.BIOMEDVLP_TEXT_ENCODER:
+            raise ValueError(
+                f"{name} is a CXR text encoder, not an image encoder. "
+                f"Use --vision-encoder-type biomedclip --vision-encoder-name {self.BIOMEDCLIP_IMAGE_ENCODER} for CXR images."
+            )
+        model = AutoModel.from_pretrained(name, trust_remote_code=True)
+        out_dim = _hf_hidden_size(model.config)
+        return model, out_dim
+
+    def _build_biomedclip_backbone(self, name: str) -> tuple[nn.Module, int]:
+        try:
+            import open_clip
+        except Exception as exc:
+            raise ImportError("BiomedCLIP vision encoding requires `pip install open_clip_torch`.") from exc
+        model_name = name
+        if name == self.BIOMEDVLP_TEXT_ENCODER:
+            model_name = self.BIOMEDCLIP_IMAGE_ENCODER
+        if hasattr(open_clip, "create_model_from_pretrained"):
+            loaded = open_clip.create_model_from_pretrained(f"hf-hub:{model_name}")
+            model = loaded[0] if isinstance(loaded, tuple) else loaded
+        else:
+            model, _, _ = open_clip.create_model_and_transforms(f"hf-hub:{model_name}")
+        visual = model.visual
+        out_dim = int(getattr(visual, "output_dim", 0) or getattr(model, "embed_dim", 0) or 512)
+        return visual, out_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.local_encoder is not None:
+            return self.local_encoder(x)
+        if self.encoder_type in {"torchvision", "radimagenet"}:
+            feat = self.backbone(x)
+            if feat.ndim == 4:
+                feat = F.adaptive_avg_pool2d(feat, (self.patch_grid, self.patch_grid)).flatten(2).transpose(1, 2)
+            else:
+                feat = feat.unsqueeze(1).expand(-1, self.num_regions, -1)
+        elif self.encoder_type == "hf":
+            out = self.backbone(pixel_values=x, output_hidden_states=True, return_dict=True)
+            feat = self._sequence_to_regions(out.last_hidden_state)
+        elif self.encoder_type == "biomedclip":
+            feat = self._biomedclip_features(x)
+        else:
+            raise RuntimeError(f"Unsupported encoder type '{self.encoder_type}'.")
+        feat = self.output_proj(self.dropout(feat))
+        return feat + self.pos_embed.unsqueeze(0) + self.quadrant_embed(self._anatomy_ids(x.device)).unsqueeze(0)
+
+    def _sequence_to_regions(self, seq: torch.Tensor) -> torch.Tensor:
+        if seq.ndim != 3:
+            return seq.reshape(seq.shape[0], 1, -1).expand(-1, self.num_regions, -1)
+        tokens = seq[:, 1:] if seq.shape[1] > 1 else seq
+        side = int(tokens.shape[1] ** 0.5)
+        if side * side == tokens.shape[1]:
+            fmap = tokens.transpose(1, 2).reshape(tokens.shape[0], tokens.shape[2], side, side)
+            return F.adaptive_avg_pool2d(fmap, (self.patch_grid, self.patch_grid)).flatten(2).transpose(1, 2)
+        pooled = tokens.mean(dim=1, keepdim=True)
+        return pooled.expand(-1, self.num_regions, -1)
+
+    def _biomedclip_features(self, x: torch.Tensor) -> torch.Tensor:
+        visual = self.backbone
+        if hasattr(visual, "forward_features"):
+            features = visual.forward_features(x)
+            if isinstance(features, dict):
+                features = features.get("x") or features.get("last_hidden_state") or next(iter(features.values()))
+            if features.ndim == 3:
+                return self._sequence_to_regions(features)
+            if features.ndim == 4:
+                return F.adaptive_avg_pool2d(features, (self.patch_grid, self.patch_grid)).flatten(2).transpose(1, 2)
+        features = visual(x)
+        if features.ndim == 3:
+            return self._sequence_to_regions(features)
+        if features.ndim == 4:
+            return F.adaptive_avg_pool2d(features, (self.patch_grid, self.patch_grid)).flatten(2).transpose(1, 2)
+        return features.unsqueeze(1).expand(-1, self.num_regions, -1)
+
+    def _anatomy_ids(self, device: torch.device) -> torch.Tensor:
+        ids = []
+        for y in range(self.patch_grid):
+            for x in range(self.patch_grid):
+                ids.append((y >= self.patch_grid / 2) * 2 + (x >= self.patch_grid / 2))
+        return torch.tensor(ids, device=device, dtype=torch.long)
+
+
 class DynamicGraphCaptioner(nn.Module):
     def __init__(
         self,
@@ -131,6 +300,10 @@ class DynamicGraphCaptioner(nn.Module):
         anatomy_concept_prior: torch.Tensor | None = None,
         relation_prior_weight: float = 1.0,
         use_anatomy: bool = True,
+        vision_encoder_type: str = "cnn",
+        vision_encoder_name: str | None = None,
+        vision_checkpoint: str | None = None,
+        freeze_vision_encoder: bool = False,
     ) -> None:
         super().__init__()
         self.concept_names = concept_names
@@ -143,7 +316,15 @@ class DynamicGraphCaptioner(nn.Module):
         self.num_anatomy = len(self.anatomy_names)
         self.use_anatomy = use_anatomy and self.num_anatomy > 0
 
-        self.region_encoder = RegionEncoder(embed_dim, patch_grid=patch_grid, dropout=dropout)
+        self.region_encoder = PretrainedVisionRegionEncoder(
+            embed_dim,
+            patch_grid=patch_grid,
+            dropout=dropout,
+            encoder_type=vision_encoder_type,
+            encoder_name=vision_encoder_name,
+            checkpoint_path=vision_checkpoint,
+            freeze=freeze_vision_encoder,
+        )
         self.token_embed = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_id)
         self.concept_embed = nn.Parameter(torch.randn(self.num_concepts, embed_dim) * 0.02)
         self.anatomy_embed = nn.Parameter(torch.randn(max(1, self.num_anatomy), embed_dim) * 0.02)
@@ -411,6 +592,10 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         anatomy_concept_prior: torch.Tensor | None = None,
         relation_prior_weight: float = 1.0,
         use_anatomy: bool = True,
+        vision_encoder_type: str = "cnn",
+        vision_encoder_name: str | None = None,
+        vision_checkpoint: str | None = None,
+        freeze_vision_encoder: bool = False,
         freeze_llm: bool = False,
         prefix_length: int = 4,
         concept_logit_bias: float = 0.8,
@@ -434,6 +619,10 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
             anatomy_concept_prior=anatomy_concept_prior,
             relation_prior_weight=relation_prior_weight,
             use_anatomy=use_anatomy,
+            vision_encoder_type=vision_encoder_type,
+            vision_encoder_name=vision_encoder_name,
+            vision_checkpoint=vision_checkpoint,
+            freeze_vision_encoder=freeze_vision_encoder,
         )
         self.llm_name = llm_name
         self.llm = AutoModelForCausalLM.from_pretrained(llm_name)
@@ -642,6 +831,10 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         anatomy_concept_prior: torch.Tensor | None = None,
         relation_prior_weight: float = 1.0,
         use_anatomy: bool = True,
+        vision_encoder_type: str = "cnn",
+        vision_encoder_name: str | None = None,
+        vision_checkpoint: str | None = None,
+        freeze_vision_encoder: bool = False,
         freeze_llm: bool = False,
         prefix_length: int = 4,
         concept_logit_bias: float = 0.8,
@@ -666,6 +859,10 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
             anatomy_concept_prior=anatomy_concept_prior,
             relation_prior_weight=relation_prior_weight,
             use_anatomy=use_anatomy,
+            vision_encoder_type=vision_encoder_type,
+            vision_encoder_name=vision_encoder_name,
+            vision_checkpoint=vision_checkpoint,
+            freeze_vision_encoder=freeze_vision_encoder,
         )
         self.llm_name = llm_name
         self.llm = AutoModelForSeq2SeqLM.from_pretrained(llm_name)

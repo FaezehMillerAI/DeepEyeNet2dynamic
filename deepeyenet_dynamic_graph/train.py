@@ -37,6 +37,10 @@ def parse_args() -> Config:
     parser.add_argument("--relation-extractor", choices=["none", "rules", "llm"], default="rules")
     parser.add_argument("--relation-extractor-model", default="gpt-4o-mini")
     parser.add_argument("--relation-prior-weight", type=float, default=1.0)
+    parser.add_argument("--vision-encoder-type", choices=["cnn", "hf", "torchvision", "radimagenet", "biomedclip"], default="cnn")
+    parser.add_argument("--vision-encoder-name", default=None)
+    parser.add_argument("--vision-checkpoint", default=None)
+    parser.add_argument("--freeze-vision-encoder", action="store_true")
     parser.add_argument("--decoder-type", choices=["llm", "causal_lm", "seq2seq", "gru"], default="llm")
     parser.add_argument("--llm-name", default="distilgpt2")
     parser.add_argument("--freeze-llm", action="store_true")
@@ -75,6 +79,10 @@ def parse_args() -> Config:
         relation_extractor=args.relation_extractor,
         relation_extractor_model=args.relation_extractor_model,
         relation_prior_weight=args.relation_prior_weight,
+        vision_encoder_type=args.vision_encoder_type,
+        vision_encoder_name=args.vision_encoder_name,
+        vision_checkpoint=args.vision_checkpoint,
+        freeze_vision_encoder=args.freeze_vision_encoder,
         decoder_type=args.decoder_type,
         llm_name=args.llm_name,
         freeze_llm=args.freeze_llm,
@@ -161,6 +169,10 @@ def _build_hf_model(cfg: Config, tokenizer, concepts: list[str], concept_graph: 
         _anatomy_concept_prior_from_graph(cfg, concepts, concept_graph),
         cfg.relation_prior_weight,
         cfg.use_anatomy,
+        cfg.vision_encoder_type,
+        cfg.vision_encoder_name,
+        cfg.vision_checkpoint,
+        cfg.freeze_vision_encoder,
         cfg.freeze_llm,
         cfg.prefix_length,
         cfg.concept_logit_bias,
@@ -277,6 +289,7 @@ def main() -> None:
     tqdm.write(f"Output directory: {out_dir}")
     tqdm.write(f"Device: {device}")
     tqdm.write(f"Dataset: {cfg.dataset} | decoder: {cfg.decoder_type} | LLM: {cfg.llm_name}")
+    tqdm.write(f"Vision encoder: {cfg.vision_encoder_type} | name: {cfg.vision_encoder_name or 'default'} | frozen: {cfg.freeze_vision_encoder}")
     if _uses_hf_decoder(cfg):
         from transformers import AutoTokenizer
 
@@ -392,6 +405,10 @@ def main() -> None:
             _anatomy_concept_prior_from_graph(cfg, concepts, concept_graph),
             cfg.relation_prior_weight,
             cfg.use_anatomy,
+            cfg.vision_encoder_type,
+            cfg.vision_encoder_name,
+            cfg.vision_checkpoint,
+            cfg.freeze_vision_encoder,
         ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     best = float("inf")

@@ -87,6 +87,10 @@ def _build_hf_model(cfg: Config, tokenizer, concepts: list[str], concept_graph: 
         _anatomy_concept_prior_from_graph(cfg, concepts, concept_graph),
         cfg.relation_prior_weight,
         cfg.use_anatomy,
+        cfg.vision_encoder_type,
+        cfg.vision_encoder_name,
+        cfg.vision_checkpoint,
+        cfg.freeze_vision_encoder,
         cfg.freeze_llm,
         cfg.prefix_length,
         cfg.concept_logit_bias,
@@ -132,6 +136,10 @@ def main() -> None:
             _anatomy_concept_prior_from_graph(cfg, concepts, concept_graph),
             cfg.relation_prior_weight,
             cfg.use_anatomy,
+            cfg.vision_encoder_type,
+            cfg.vision_encoder_name,
+            cfg.vision_checkpoint,
+            cfg.freeze_vision_encoder,
         ).to(device)
         decoder = vocab
     ckpt = torch.load(args.checkpoint, map_location=device)

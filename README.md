@@ -7,6 +7,7 @@ The original markdown describes a dynamic explanation graph for chest X-ray repo
 ## What Is Included
 
 - Region-aware retinal image encoder using fixed spatial patches.
+- Pluggable vision backbones: local CNN, HuggingFace ViT/Swin-style encoders, BiomedCLIP, and RadImageNet/torchvision checkpoints.
 - Concept vocabulary built from DeepEyeNet `Keywords`.
 - Dynamic region-to-concept graph updated during decoding.
 - LLM report decoders conditioned on the anatomy-aware explanation graph through learned soft-prefix embeddings, with both decoder-only and encoder-decoder HuggingFace models supported.
@@ -103,6 +104,44 @@ python -m deepeyenet_dynamic_graph.evaluate \
 ```
 
 The evaluation folder includes `interactive_explanations.html`. Open it in a browser to hover over image regions and inspect anatomy, top findings, linked report text, and counterfactual drops.
+
+## Vision Encoders
+
+The default image encoder is the small local CNN:
+
+```bash
+--vision-encoder-type cnn
+```
+
+For stronger CXR features, use a HuggingFace vision model:
+
+```bash
+--vision-encoder-type hf \
+--vision-encoder-name google/vit-base-patch16-224
+```
+
+For CXR-specific Microsoft vision-language pretraining, use BiomedCLIP's image tower:
+
+```bash
+--vision-encoder-type biomedclip \
+--vision-encoder-name microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224
+```
+
+Important: `microsoft/BiomedVLP-CXR-BERT-specialized` is a CXR text encoder, not an image encoder. The BiomedCLIP model above is the Microsoft image-text model to use for CXR images.
+
+For a RadImageNet-style checkpoint saved on Drive, use a torchvision architecture and checkpoint path:
+
+```bash
+--vision-encoder-type radimagenet \
+--vision-encoder-name resnet50 \
+--vision-checkpoint /content/drive/MyDrive/path/to/radimagenet_resnet50.pth
+```
+
+You can freeze large pretrained image backbones for faster Colab training:
+
+```bash
+--freeze-vision-encoder
+```
 
 ## LLM Decoders
 
@@ -290,7 +329,7 @@ For Colab, open `notebooks/DeepEyeNet_Dynamic_Graph_Colab.ipynb`, mount Drive, s
 
 ## Design Justification
 
-The dataset is small, so the model uses a compact region encoder rather than a very large end-to-end transformer. This makes experiments feasible on Colab and reduces overfitting risk. Region nodes are fixed retinal patches, concept nodes come directly from the clinical keyword labels, and token nodes are generated report tokens. This design is faithful to the proposed methodology while keeping the implementation auditable and runnable with limited compute.
+The dataset is small, so the default model uses a compact region encoder for feasibility. For CXR experiments, the implementation also supports pretrained vision backbones. HuggingFace ViT/Swin-style encoders expose patch tokens that become region nodes; CNN/RadImageNet backbones expose spatial feature maps pooled into graph regions; BiomedCLIP can provide CXR-specific global or patch-like image features depending on the underlying image tower. Region nodes are fixed patches, concept nodes come from clinical labels and relation extraction, and token nodes are generated report tokens.
 
 The training objective is deliberately decomposed. Report cross-entropy optimizes language generation; concept BCE encourages clinical label fidelity; weak graph alignment ties active concepts to keyword supervision; sparsity and temporal losses make explanations easier to inspect; faithfulness and counterfactual metrics are evaluated after training because they are more stable and cheaper as diagnostic probes than as heavy inner-loop objectives on a small dataset.
 
