@@ -58,6 +58,34 @@ def concept_set_from_probs(concepts: list[str], probs, threshold: float = 0.35, 
     return {normalize_concept(c) for c in selected if normalize_concept(c)}
 
 
+_NORMAL_CONCEPTS = {
+    "normal",
+    "no acute abnormality",
+    "no acute cardiopulmonary abnormality",
+    "no acute cardiopulmonary disease",
+    "no acute disease",
+    "no active disease",
+    "clear lungs",
+    "lungs clear",
+}
+
+
+def _is_normal_or_absent_concept(concept: str) -> bool:
+    concept = normalize_concept(concept)
+    return (
+        not concept
+        or concept in _NORMAL_CONCEPTS
+        or concept.startswith("no ")
+        or concept.startswith("without ")
+        or concept.startswith("negative for ")
+        or concept.startswith("absence of ")
+    )
+
+
+def abnormal_concepts(concepts: set[str]) -> set[str]:
+    return {normalize_concept(c) for c in concepts if not _is_normal_or_absent_concept(c)}
+
+
 def retrieve_report(
     memory: list[dict[str, Any]],
     query_concepts: set[str],
@@ -65,17 +93,23 @@ def retrieve_report(
 ) -> tuple[str | None, float]:
     if not memory or not query_concepts:
         return None, 0.0
+    query_abnormal = abnormal_concepts(query_concepts)
     best_report = None
     best_score = 0.0
     for entry in memory:
         entry_concepts = {normalize_concept(c) for c in entry.get("concepts", []) if normalize_concept(c)}
         if not entry_concepts:
             continue
+        entry_abnormal = abnormal_concepts(entry_concepts)
+        if query_abnormal and not (query_abnormal & entry_abnormal):
+            continue
         overlap = len(query_concepts & entry_concepts)
         union = len(query_concepts | entry_concepts)
         jaccard = overlap / max(1, union)
+        abnormal_overlap = len(query_abnormal & entry_abnormal)
+        abnormal_bonus = 0.15 * abnormal_overlap
         frequency_bonus = min(0.10, 0.01 * float(entry.get("count", 1)))
-        score = jaccard + frequency_bonus
+        score = jaccard + abnormal_bonus + frequency_bonus
         if score > best_score:
             best_score = score
             best_report = str(entry.get("report", ""))

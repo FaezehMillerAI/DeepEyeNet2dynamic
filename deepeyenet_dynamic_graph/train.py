@@ -58,7 +58,12 @@ def parse_args() -> Config:
     parser.add_argument("--disable-counterfactuals", action="store_true")
     parser.add_argument("--no-report-memory", action="store_true")
     parser.add_argument("--report-memory-max-entries", type=int, default=2500)
-    parser.add_argument("--report-memory-min-score", type=float, default=0.05)
+    parser.add_argument("--report-memory-min-score", type=float, default=0.20)
+    parser.add_argument("--generation-num-beams", type=int, default=3)
+    parser.add_argument("--generation-min-len", type=int, default=24)
+    parser.add_argument("--generation-no-repeat-ngram-size", type=int, default=3)
+    parser.add_argument("--generation-repetition-penalty", type=float, default=1.15)
+    parser.add_argument("--generation-length-penalty", type=float, default=1.0)
     parser.add_argument("--progress-style", choices=["epoch", "batch", "none"], default="epoch")
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
@@ -102,6 +107,11 @@ def parse_args() -> Config:
         use_report_memory=not args.no_report_memory,
         report_memory_max_entries=args.report_memory_max_entries,
         report_memory_min_score=args.report_memory_min_score,
+        generation_num_beams=args.generation_num_beams,
+        generation_min_len=args.generation_min_len,
+        generation_no_repeat_ngram_size=args.generation_no_repeat_ngram_size,
+        generation_repetition_penalty=args.generation_repetition_penalty,
+        generation_length_penalty=args.generation_length_penalty,
         progress_style=args.progress_style,
         device=args.device,
     )

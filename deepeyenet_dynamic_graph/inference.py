@@ -19,6 +19,11 @@ def parse_args():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--image", required=True)
     parser.add_argument("--max-report-len", type=int, default=96)
+    parser.add_argument("--generation-num-beams", type=int, default=None)
+    parser.add_argument("--generation-min-len", type=int, default=None)
+    parser.add_argument("--generation-no-repeat-ngram-size", type=int, default=None)
+    parser.add_argument("--generation-repetition-penalty", type=float, default=None)
+    parser.add_argument("--generation-length-penalty", type=float, default=None)
     parser.add_argument("--no-report-memory", action="store_true")
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
@@ -30,6 +35,16 @@ def _uses_hf_decoder(cfg: Config) -> bool:
 
 def _is_seq2seq_decoder(cfg: Config) -> bool:
     return cfg.decoder_type == "seq2seq"
+
+
+def _generation_kwargs(cfg: Config) -> dict:
+    return {
+        "num_beams": cfg.generation_num_beams,
+        "min_len": cfg.generation_min_len,
+        "no_repeat_ngram_size": cfg.generation_no_repeat_ngram_size,
+        "repetition_penalty": cfg.generation_repetition_penalty,
+        "length_penalty": cfg.generation_length_penalty,
+    }
 
 
 def _prepare_tokenizer(tokenizer):
@@ -107,6 +122,16 @@ def main() -> None:
     cfg.device = args.device
     if args.no_report_memory:
         cfg.use_report_memory = False
+    if args.generation_num_beams is not None:
+        cfg.generation_num_beams = args.generation_num_beams
+    if args.generation_min_len is not None:
+        cfg.generation_min_len = args.generation_min_len
+    if args.generation_no_repeat_ngram_size is not None:
+        cfg.generation_no_repeat_ngram_size = args.generation_no_repeat_ngram_size
+    if args.generation_repetition_penalty is not None:
+        cfg.generation_repetition_penalty = args.generation_repetition_penalty
+    if args.generation_length_penalty is not None:
+        cfg.generation_length_penalty = args.generation_length_penalty
     concepts = load_json(run_dir / "concepts.json")["concepts"]
     concept_graph_path = run_dir / "concept_graph.json"
     concept_graph = load_json(concept_graph_path) if concept_graph_path.exists() else None
@@ -147,7 +172,7 @@ def main() -> None:
     model.eval()
     transform = make_transforms(cfg.image_size, train=False)
     image = transform(Image.open(args.image).convert("RGB")).unsqueeze(0).to(device)
-    output, gen_tokens = model.generate(image, max_len=args.max_report_len)
+    output, gen_tokens = model.generate(image, max_len=args.max_report_len, **_generation_kwargs(cfg))
     if hasattr(decoder, "itos"):
         report = decoder.decode(gen_tokens[0].cpu().tolist())
     else:

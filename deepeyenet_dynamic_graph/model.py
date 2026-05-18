@@ -476,7 +476,7 @@ class DynamicGraphCaptioner(nn.Module):
         return DecodeOutput(logits_t, concept_logits, rc_edges_t, token_concept_t, region_features, concept_features, ra_edges, ac_edges, anatomy_features)
 
     @torch.no_grad()
-    def generate(self, images: torch.Tensor, max_len: int = 96) -> DecodeOutput:
+    def generate(self, images: torch.Tensor, max_len: int = 96, **_: object) -> DecodeOutput:
         batch = images.shape[0]
         tokens = torch.full((batch, max_len), self.pad_id, dtype=torch.long, device=images.device)
         tokens[:, 0] = self.bos_id
@@ -759,7 +759,7 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         return DecodeOutput(logits, concept_logits, rc_seq, token_concept, region_features, concept_features, ra_edges, ac_edges, anatomy_features, lm_out.loss)
 
     @torch.no_grad()
-    def generate(self, images: torch.Tensor, max_len: int = 96) -> tuple[DecodeOutput, torch.Tensor]:
+    def generate(self, images: torch.Tensor, max_len: int = 96, **_: object) -> tuple[DecodeOutput, torch.Tensor]:
         prefix, region_features, ra_edges, ac_edges, anatomy_features, concept_features = self._graph_forward(images)
         batch = images.shape[0]
         start_id = self.bos_id if self.bos_id is not None and self.bos_id >= 0 else self.eos_id
@@ -869,6 +869,18 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         self.llm_dim = _hf_hidden_size(self.llm.config)
         self.concept_logit_bias = float(concept_logit_bias)
         tokenizer = AutoTokenizer.from_pretrained(llm_name)
+        self.encoder_prompt = (
+            "Generate a chest x-ray radiology report. "
+            "Describe visible abnormal and normal findings, then write the impression."
+        )
+        prompt_ids = tokenizer(
+            self.encoder_prompt,
+            add_special_tokens=True,
+            return_tensors="pt",
+        ).input_ids[0]
+        if prompt_ids.numel() == 0:
+            prompt_ids = torch.tensor([int(pad_id if pad_id is not None else fallback_id)], dtype=torch.long)
+        self.register_buffer("encoder_prompt_ids", prompt_ids.long(), persistent=False)
         self.register_buffer(
             "concept_token_mask",
             _build_concept_token_mask(tokenizer, concept_names, int(self.llm.config.vocab_size)),
@@ -939,6 +951,14 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         prefix = self.prefix_proj(base).unsqueeze(1).expand(batch, self.prefix_length, self.llm_dim)
         return prefix + self.prefix_offset.unsqueeze(0)
 
+    def _encoder_inputs(self, prefix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch = prefix.shape[0]
+        prompt_ids = self.encoder_prompt_ids.to(prefix.device).unsqueeze(0).expand(batch, -1)
+        prompt_embeds = self.llm.get_input_embeddings()(prompt_ids)
+        inputs_embeds = torch.cat([prefix, prompt_embeds], dim=1)
+        attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=prefix.device)
+        return inputs_embeds, attention_mask
+
     def _graph_forward(
         self,
         images: torch.Tensor,
@@ -992,11 +1012,11 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         )
         if attention_mask is None:
             attention_mask = (tokens != self.pad_id).long()
-        encoder_mask = torch.ones(tokens.shape[0], self.prefix_length, dtype=attention_mask.dtype, device=tokens.device)
+        encoder_inputs, encoder_mask = self._encoder_inputs(prefix)
         labels = tokens.clone()
         labels[attention_mask == 0] = -100
         lm_out = self.llm(
-            inputs_embeds=prefix,
+            inputs_embeds=encoder_inputs,
             attention_mask=encoder_mask,
             labels=labels,
             output_hidden_states=True,
@@ -1025,40 +1045,38 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         )
 
     @torch.no_grad()
-    def generate(self, images: torch.Tensor, max_len: int = 96) -> tuple[DecodeOutput, torch.Tensor]:
+    def generate(
+        self,
+        images: torch.Tensor,
+        max_len: int = 96,
+        num_beams: int = 3,
+        min_len: int = 24,
+        no_repeat_ngram_size: int = 3,
+        repetition_penalty: float = 1.15,
+        length_penalty: float = 1.0,
+    ) -> tuple[DecodeOutput, torch.Tensor]:
         prefix, region_features, ra_edges, ac_edges, anatomy_features, concept_features = self._graph_forward(images)
         batch = images.shape[0]
-        encoder_mask = torch.ones(batch, self.prefix_length, dtype=torch.long, device=images.device)
+        encoder_inputs, encoder_mask = self._encoder_inputs(prefix)
         concept_logits = self.concept_head(concept_features).squeeze(-1)
-        decoder_input_ids = torch.full((batch, 1), self.decoder_start_id, dtype=torch.long, device=images.device)
-        generated = []
-        logits_steps = []
-        finished = torch.zeros(batch, dtype=torch.bool, device=images.device)
-        for _ in range(max_len):
-            step_out = self.llm(
-                inputs_embeds=prefix,
-                attention_mask=encoder_mask,
-                decoder_input_ids=decoder_input_ids,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            decoder_hidden = step_out.decoder_hidden_states[-1][:, -1:, :]
-            rc_step, token_concept_step = self._dynamic_edges_from_decoder_hidden(decoder_hidden, region_features, concept_features)
-            next_logits = step_out.logits[:, -1, :]
-            next_logits = self._step_concept_logit_bias(next_logits, token_concept_step[:, 0], concept_logits)
-            next_id = next_logits.argmax(dim=-1)
-            next_id = torch.where(finished, torch.full_like(next_id, self.pad_id), next_id)
-            generated.append(next_id)
-            logits_steps.append(next_logits)
-            decoder_input_ids = torch.cat([decoder_input_ids, next_id[:, None]], dim=1)
-            if self.eos_id is not None:
-                finished |= next_id == self.eos_id
-            if bool(finished.all()):
-                break
-        gen_tokens = torch.stack(generated, dim=1) if generated else torch.empty(batch, 0, dtype=torch.long, device=images.device)
+        gen_tokens = self.llm.generate(
+            inputs_embeds=encoder_inputs,
+            attention_mask=encoder_mask,
+            max_new_tokens=max_len,
+            min_new_tokens=min(min_len, max_len),
+            num_beams=max(1, int(num_beams)),
+            no_repeat_ngram_size=max(0, int(no_repeat_ngram_size)),
+            repetition_penalty=float(repetition_penalty),
+            length_penalty=float(length_penalty),
+            early_stopping=True,
+            pad_token_id=self.pad_id,
+            eos_token_id=self.eos_id,
+        )
+        if gen_tokens.shape[1] > 0 and torch.all(gen_tokens[:, 0] == self.decoder_start_id):
+            gen_tokens = gen_tokens[:, 1:]
         decoder_input_ids = self._shift_right(gen_tokens)
         lm_out = self.llm(
-            inputs_embeds=prefix,
+            inputs_embeds=encoder_inputs,
             attention_mask=encoder_mask,
             decoder_input_ids=decoder_input_ids,
             output_hidden_states=True,
@@ -1075,10 +1093,7 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         else:
             rc_seq = torch.empty(batch, 0, region_features.shape[1], self.num_concepts, device=images.device)
             token_concept = torch.empty(batch, 0, self.num_concepts, device=images.device)
-        if logits_steps:
-            logits = torch.stack(logits_steps, dim=1)
-        else:
-            logits = self._apply_concept_logit_bias(lm_out.logits, token_concept, concept_logits)
+        logits = self._apply_concept_logit_bias(lm_out.logits, token_concept, concept_logits)
         return DecodeOutput(
             logits,
             concept_logits,

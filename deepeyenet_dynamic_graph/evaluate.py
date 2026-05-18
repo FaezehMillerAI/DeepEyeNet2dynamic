@@ -53,6 +53,16 @@ def _is_seq2seq_decoder(cfg: Config) -> bool:
     return cfg.decoder_type == "seq2seq"
 
 
+def _generation_kwargs(cfg: Config) -> dict:
+    return {
+        "num_beams": cfg.generation_num_beams,
+        "min_len": cfg.generation_min_len,
+        "no_repeat_ngram_size": cfg.generation_no_repeat_ngram_size,
+        "repetition_penalty": cfg.generation_repetition_penalty,
+        "length_penalty": cfg.generation_length_penalty,
+    }
+
+
 def _prepare_tokenizer(tokenizer):
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -232,7 +242,7 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
         attention_mask = batch.get("attention_mask")
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
-        output, gen_tokens = model.generate(images, max_len=cfg.max_report_len)
+        output, gen_tokens = model.generate(images, max_len=cfg.max_report_len, **_generation_kwargs(cfg))
         if attention_mask is not None:
             teacher_output = model(images, tokens, attention_mask=attention_mask)
         else:

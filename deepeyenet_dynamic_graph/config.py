@@ -42,7 +42,12 @@ class Config:
     max_interactive_examples: int = 12
     use_report_memory: bool = True
     report_memory_max_entries: int = 2500
-    report_memory_min_score: float = 0.05
+    report_memory_min_score: float = 0.20
+    generation_num_beams: int = 3
+    generation_min_len: int = 24
+    generation_no_repeat_ngram_size: int = 3
+    generation_repetition_penalty: float = 1.15
+    generation_length_penalty: float = 1.0
     progress_style: str = "epoch"
     dropout: float = 0.2
     batch_size: int = 8
