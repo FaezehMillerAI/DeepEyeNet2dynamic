@@ -21,7 +21,7 @@ from .vocab import build_concepts
 def parse_args() -> Config:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", required=True)
-    parser.add_argument("--dataset", choices=["deepeyenet", "iuxray"], default="deepeyenet")
+    parser.add_argument("--dataset", choices=["deepeyenet", "iuxray", "mimic_cxr"], default="deepeyenet")
     parser.add_argument("--output-dir", default="outputs/deepeyenet_dynamic_graph")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=8)

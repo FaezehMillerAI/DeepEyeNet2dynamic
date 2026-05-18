@@ -50,10 +50,47 @@ IU_XRAY_TERMS = [
     "hiatal hernia",
 ]
 
+MIMIC_CXR_TERMS = sorted(
+    set(
+        IU_XRAY_TERMS
+        + [
+            "airspace opacity",
+            "calcification",
+            "chf",
+            "collapse",
+            "enlarged cardiomediastinum",
+            "lung lesion",
+            "lung opacity",
+            "medical device",
+            "pleural effusion",
+            "support devices",
+            "vascular redistribution",
+        ]
+    )
+)
+
+MIMIC_LABEL_COLUMNS = {
+    "atelectasis": "atelectasis",
+    "cardiomegaly": "cardiomegaly",
+    "consolidation": "consolidation",
+    "edema": "edema",
+    "enlarged cardiomediastinum": "enlarged cardiomediastinum",
+    "fracture": "fracture",
+    "lung lesion": "lung lesion",
+    "lung opacity": "opacity",
+    "no finding": "no acute cardiopulmonary abnormality",
+    "pleural effusion": "pleural effusion",
+    "pleural other": "pleural thickening",
+    "pneumonia": "pneumonia",
+    "pneumothorax": "pneumothorax",
+    "support devices": "support devices",
+}
+
 
 ANATOMY_NODES = {
     "deepeyenet": ["superior retina", "inferior retina", "nasal retina", "temporal retina", "macula", "optic disc", "retinal vessels"],
     "iuxray": ["left upper lung", "left lower lung", "right upper lung", "right lower lung", "cardiac silhouette", "mediastinum", "pleura"],
+    "mimic_cxr": ["left upper lung", "left lower lung", "right upper lung", "right lower lung", "cardiac silhouette", "mediastinum", "pleura"],
 }
 
 
@@ -63,7 +100,9 @@ def normalize_dataset_name(dataset: str) -> str:
         return "deepeyenet"
     if normalized in {"iuxray", "iuchestxray", "indianaxray"}:
         return "iuxray"
-    raise ValueError(f"Unsupported dataset '{dataset}'. Use 'deepeyenet' or 'iuxray'.")
+    if normalized in {"mimiccxr", "mimic", "mimicchestxray"}:
+        return "mimic_cxr"
+    raise ValueError(f"Unsupported dataset '{dataset}'. Use 'deepeyenet', 'iuxray', or 'mimic_cxr'.")
 
 
 def get_anatomy_names(dataset: str) -> list[str]:
@@ -342,13 +381,203 @@ def load_iuxray_split_records(data_root: str | Path, split: str, seed: int = 42)
     return records
 
 
+def _find_first_existing(paths: list[Path]) -> Path | None:
+    for path in paths:
+        if path.exists():
+            return path
+    return None
+
+
+def _find_mimic_csv(data_root: Path, split: str) -> tuple[Path, bool]:
+    roots = []
+    for root in [data_root, data_root.parent, data_root.parent.parent]:
+        if root not in roots:
+            roots.append(root)
+    train_names = ["mimic_cxr_aug_train.csv", "train.csv", "mimic_train.csv"]
+    valid_names = ["mimic_cxr_aug_validate.csv", "mimic_cxr_aug_valid.csv", "valid.csv", "validate.csv", "val.csv", "mimic_valid.csv"]
+    test_names = ["mimic_cxr_aug_test.csv", "test.csv", "mimic_test.csv"]
+    if split == "train":
+        names = train_names
+    elif split in {"valid", "val"}:
+        names = valid_names
+    else:
+        names = test_names
+    found = _find_first_existing([root / name for root in roots for name in names])
+    if found is not None:
+        return found, False
+    if split == "test":
+        fallback = _find_first_existing([root / name for root in roots for name in valid_names])
+        if fallback is not None:
+            return fallback, True
+    raise FileNotFoundError(
+        f"Could not find MIMIC-CXR CSV for split '{split}'. Looked near {data_root}. "
+        "Expected files such as mimic_cxr_aug_train.csv and mimic_cxr_aug_validate.csv."
+    )
+
+
+def _column_lookup(df: pd.DataFrame) -> dict[str, str]:
+    return {str(col).lower().strip(): str(col) for col in df.columns}
+
+
+def _first_column(df: pd.DataFrame, names: list[str]) -> str | None:
+    lookup = _column_lookup(df)
+    for name in names:
+        key = name.lower().strip()
+        if key in lookup:
+            return lookup[key]
+    return None
+
+
+def _mimic_report_text(row: pd.Series) -> str:
+    lower_to_col = {str(col).lower().strip(): col for col in row.index}
+    for name in ["report_text", "report", "text", "findings_impression", "section_findings_impression"]:
+        col = lower_to_col.get(name)
+        if col is not None and _clean_text(row.get(col, "")):
+            return _clean_text(row.get(col, ""))
+    findings = _clean_text(row.get(lower_to_col.get("findings", ""), ""))
+    impression = _clean_text(row.get(lower_to_col.get("impression", ""), ""))
+    parts = []
+    if findings:
+        parts.append(f"Findings: {findings}")
+    if impression:
+        parts.append(f"Impression: {impression}")
+    return " ".join(parts)
+
+
+def _is_positive_label(value: Any) -> bool:
+    if pd.isna(value):
+        return False
+    text = str(value).strip().lower()
+    if text in {"1", "1.0", "true", "yes", "positive", "present"}:
+        return True
+    try:
+        return float(text) > 0
+    except Exception:
+        return False
+
+
+def _mimic_keywords(row: pd.Series, report: str) -> list[str]:
+    keywords = set(_iu_keywords(report, extra_terms=MIMIC_CXR_TERMS))
+    lower_to_col = {str(col).lower().strip(): col for col in row.index}
+    for name in ["keywords", "labels", "label", "chexpert_labels", "findings_labels"]:
+        col = lower_to_col.get(name)
+        if col is not None:
+            keywords.update(normalize_concept(v) for v in _parse_keywords(row.get(col, "")) if normalize_concept(v))
+    for col_l, concept in MIMIC_LABEL_COLUMNS.items():
+        col = lower_to_col.get(col_l)
+        if col is not None and _is_positive_label(row.get(col)):
+            keywords.add(normalize_concept(concept))
+    return sorted(k for k in keywords if k)
+
+
+def _build_mimic_image_index(data_root: Path) -> dict[str, Path]:
+    exts = {".jpg", ".jpeg", ".png"}
+    index: dict[str, Path] = {}
+    for path in data_root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in exts:
+            index.setdefault(path.name, path)
+            index.setdefault(path.stem, path)
+    return index
+
+
+def _relative_or_absolute(path: Path, data_root: Path) -> str:
+    try:
+        return str(path.relative_to(data_root))
+    except ValueError:
+        return str(path)
+
+
+def _resolve_mimic_image_path(row: pd.Series, data_root: Path, image_index: dict[str, Path] | None = None) -> str | None:
+    lower_to_col = {str(col).lower().strip(): col for col in row.index}
+    path_cols = ["image_path", "path", "img_path", "image", "image_file", "filename", "file", "dicom_path", "jpg_path", "png_path"]
+    search_roots = [data_root, data_root.parent]
+    for name in path_cols:
+        col = lower_to_col.get(name)
+        if col is None or pd.isna(row.get(col)):
+            continue
+        raw = str(row.get(col)).strip()
+        if not raw:
+            continue
+        raw_path = Path(raw)
+        candidates = [raw_path] if raw_path.is_absolute() else [root / raw_path for root in search_roots]
+        for candidate in candidates:
+            if candidate.exists():
+                return _relative_or_absolute(candidate, data_root)
+        if image_index:
+            match = image_index.get(raw_path.name) or image_index.get(raw_path.stem)
+            if match is not None:
+                return _relative_or_absolute(match, data_root)
+    for name in ["dicom_id", "image_id", "imageid", "study_id", "studyid"]:
+        col = lower_to_col.get(name)
+        if col is not None and not pd.isna(row.get(col)):
+            key = str(row.get(col)).strip()
+            if image_index and key:
+                match = image_index.get(key) or image_index.get(Path(key).stem)
+                if match is not None:
+                    return _relative_or_absolute(match, data_root)
+    return None
+
+
+def load_mimic_cxr_split_records(data_root: str | Path, split: str, seed: int = 42) -> list[dict[str, Any]]:
+    data_root = Path(data_root)
+    csv_path, split_validate = _find_mimic_csv(data_root, split)
+    df = pd.read_csv(csv_path).copy()
+    if split_validate:
+        rng = random.Random(seed)
+        indices = list(df.index)
+        rng.shuffle(indices)
+        if len(indices) > 1:
+            midpoint = max(1, len(indices) // 2)
+            selected = set(indices[midpoint:])
+            df = df[df.index.isin(selected)]
+    elif split in {"valid", "val"} and csv_path.name in {"mimic_cxr_aug_validate.csv", "mimic_cxr_aug_valid.csv", "validate.csv", "valid.csv", "val.csv"}:
+        rng = random.Random(seed)
+        indices = list(df.index)
+        rng.shuffle(indices)
+        if len(indices) > 1:
+            midpoint = max(1, len(indices) // 2)
+            selected = set(indices[:midpoint])
+            df = df[df.index.isin(selected)]
+
+    image_col = _first_column(df, ["image_path", "path", "img_path", "image", "image_file", "filename", "file", "dicom_path", "jpg_path", "png_path"])
+    image_index = None if image_col is not None else _build_mimic_image_index(data_root)
+    records: list[dict[str, Any]] = []
+    missing_images = 0
+    for _, row in df.iterrows():
+        report = _mimic_report_text(row)
+        if not report:
+            continue
+        image_path = _resolve_mimic_image_path(row, data_root, image_index=image_index)
+        if image_path is None:
+            missing_images += 1
+            continue
+        keywords = _mimic_keywords(row, report)
+        uid = row.get("study_id", row.get("StudyID", row.get("dicom_id", image_path)))
+        records.append(
+            {
+                "image_path": image_path,
+                "keywords": keywords,
+                "clinical_description": report,
+                "report_text": report,
+                "uid": str(uid),
+            }
+        )
+    if missing_images:
+        warnings.warn(f"Skipped {missing_images} MIMIC-CXR rows because image files could not be resolved under {data_root}.")
+    if not records:
+        raise ValueError(f"No usable MIMIC-CXR records found from {csv_path} with image root {data_root}.")
+    return records
+
+
 def load_split_records(data_root: str | Path, split: str, dataset: str = "deepeyenet", seed: int = 42) -> list[dict[str, Any]]:
     dataset = normalize_dataset_name(dataset)
     if dataset == "deepeyenet":
         return load_deepeyenet_split_records(data_root, split)
-    if dataset in {"iuxray", "iuchestxray", "indianaxray"}:
+    if dataset == "iuxray":
         return load_iuxray_split_records(data_root, split, seed=seed)
-    raise ValueError(f"Unsupported dataset '{dataset}'. Use 'deepeyenet' or 'iuxray'.")
+    if dataset == "mimic_cxr":
+        return load_mimic_cxr_split_records(data_root, split, seed=seed)
+    raise ValueError(f"Unsupported dataset '{dataset}'. Use 'deepeyenet', 'iuxray', or 'mimic_cxr'.")
 
 
 def apply_record_concepts(records: list[dict[str, Any]], per_record_concepts: dict[str, list[str]]) -> list[dict[str, Any]]:

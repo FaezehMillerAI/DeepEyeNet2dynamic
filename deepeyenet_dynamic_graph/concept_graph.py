@@ -89,6 +89,15 @@ ANATOMY_ALIASES = {
         "mediastinum": ["mediastinum", "mediastinal", "hilar", "hilum"],
         "pleura": ["pleura", "pleural", "costophrenic", "pneumothorax", "effusion"],
     },
+    "mimic_cxr": {
+        "left upper lung": ["left upper lung", "left upper lobe", "left apex"],
+        "left lower lung": ["left lower lung", "left lower lobe", "left base", "left basilar"],
+        "right upper lung": ["right upper lung", "right upper lobe", "right apex"],
+        "right lower lung": ["right lower lung", "right lower lobe", "right base", "right basilar"],
+        "cardiac silhouette": ["heart", "cardiac silhouette", "cardiomediastinal silhouette"],
+        "mediastinum": ["mediastinum", "mediastinal", "hilar", "hilum"],
+        "pleura": ["pleura", "pleural", "costophrenic", "pneumothorax", "effusion"],
+    },
     "deepeyenet": {
         "superior retina": ["superior retina", "superior"],
         "inferior retina": ["inferior retina", "inferior"],
@@ -227,7 +236,7 @@ def _infer_anatomy_for_concept(concept: str, dataset: str) -> list[str]:
             priors.extend(n for n in nodes if n in anatomy_names)
     if priors:
         return sorted(set(priors))
-    if dataset == "iuxray":
+    if dataset in {"iuxray", "mimic_cxr"}:
         return [n for n in anatomy_names if "lung" in n]
     return anatomy_names[:]
 

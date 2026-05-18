@@ -31,7 +31,7 @@ from .vocab import Vocabulary, normalize_concept
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", required=True)
-    parser.add_argument("--dataset", choices=["deepeyenet", "iuxray"], default=None)
+    parser.add_argument("--dataset", choices=["deepeyenet", "iuxray", "mimic_cxr"], default=None)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output-dir", default="outputs/deepeyenet_dynamic_graph/eval")
     parser.add_argument("--split", default="test", choices=["train", "valid", "test"])

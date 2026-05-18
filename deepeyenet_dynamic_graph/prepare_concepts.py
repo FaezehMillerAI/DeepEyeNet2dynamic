@@ -11,7 +11,7 @@ from .utils import save_json
 def parse_args():
     parser = argparse.ArgumentParser(description="Build RadGraph/hybrid clinical concept graph artifacts.")
     parser.add_argument("--data-root", required=True)
-    parser.add_argument("--dataset", choices=["deepeyenet", "iuxray"], default="iuxray")
+    parser.add_argument("--dataset", choices=["deepeyenet", "iuxray", "mimic_cxr"], default="iuxray")
     parser.add_argument("--split", default="train", choices=["train", "valid", "test"])
     parser.add_argument("--output", default="outputs/concept_graph.json")
     parser.add_argument("--max-concepts", type=int, default=128)
