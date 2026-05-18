@@ -723,11 +723,13 @@ class MedicalReportDataset(Dataset):
         max_report_len: int = 96,
         seed: int = 42,
         per_record_concepts: dict[str, list[str]] | None = None,
+        records: list[dict[str, Any]] | None = None,
     ) -> None:
         self.data_root = Path(data_root)
         self.split = split
         self.dataset = dataset
-        self.records = apply_record_concepts(load_split_records(data_root, split, dataset=dataset, seed=seed), per_record_concepts or {})
+        base_records = records if records is not None else load_split_records(data_root, split, dataset=dataset, seed=seed)
+        self.records = apply_record_concepts(base_records, per_record_concepts or {})
         self.vocab = vocab
         self.concepts = concepts
         self.concept_to_idx = {c: i for i, c in enumerate(concepts)}
@@ -785,11 +787,13 @@ class HFMedicalReportDataset(Dataset):
         max_report_len: int = 96,
         seed: int = 42,
         per_record_concepts: dict[str, list[str]] | None = None,
+        records: list[dict[str, Any]] | None = None,
     ) -> None:
         self.data_root = Path(data_root)
         self.split = split
         self.dataset = dataset
-        self.records = apply_record_concepts(load_split_records(data_root, split, dataset=dataset, seed=seed), per_record_concepts or {})
+        base_records = records if records is not None else load_split_records(data_root, split, dataset=dataset, seed=seed)
+        self.records = apply_record_concepts(base_records, per_record_concepts or {})
         self.tokenizer = tokenizer
         self.concepts = concepts
         self.concept_to_idx = {c: i for i, c in enumerate(concepts)}

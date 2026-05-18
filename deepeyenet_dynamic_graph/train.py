@@ -30,6 +30,8 @@ def parse_args() -> Config:
     parser.add_argument("--patch-grid", type=int, default=4)
     parser.add_argument("--max-report-len", type=int, default=96)
     parser.add_argument("--max-concepts", type=int, default=128)
+    parser.add_argument("--max-train-records", type=int, default=None)
+    parser.add_argument("--max-valid-records", type=int, default=None)
     parser.add_argument("--concept-source", choices=["keywords", "hybrid", "radgraph"], default="hybrid")
     parser.add_argument("--radgraph-path", default=None)
     parser.add_argument("--concept-normalizer", choices=["rules", "llm"], default="rules")
@@ -80,6 +82,8 @@ def parse_args() -> Config:
         patch_grid=args.patch_grid,
         max_report_len=args.max_report_len,
         max_concepts=args.max_concepts,
+        max_train_records=args.max_train_records,
+        max_valid_records=args.max_valid_records,
         concept_source=args.concept_source,
         radgraph_path=args.radgraph_path,
         concept_normalizer=args.concept_normalizer,
@@ -128,6 +132,13 @@ def _uses_hf_decoder(cfg: Config) -> bool:
 
 def _is_seq2seq_decoder(cfg: Config) -> bool:
     return cfg.decoder_type == "seq2seq"
+
+
+def _limit_records(records: list[dict], max_records: int | None, label: str) -> list[dict]:
+    if max_records is None or max_records <= 0 or len(records) <= max_records:
+        return records
+    tqdm.write(f"Using first {max_records:,} {label} records out of {len(records):,}.")
+    return records[:max_records]
 
 
 def _prepare_tokenizer(tokenizer):
@@ -322,6 +333,7 @@ def main() -> None:
         tokenizer.save_pretrained(out_dir)
         tqdm.write("Loading training metadata and image paths...")
         train_records = load_split_records(cfg.data_root, "train", dataset=cfg.dataset, seed=cfg.seed)
+        train_records = _limit_records(train_records, cfg.max_train_records, "training")
         tqdm.write(f"Loaded {len(train_records):,} training image-report records.")
         tqdm.write("Building concept vocabulary and graph priors...")
         if cfg.concept_source == "keywords":
@@ -364,6 +376,7 @@ def main() -> None:
     else:
         vocab, concepts = build_artifacts(cfg.data_root, cfg.min_token_freq, cfg.max_vocab_size, cfg.max_concepts, dataset=cfg.dataset, seed=cfg.seed)
         train_records = load_split_records(cfg.data_root, "train", dataset=cfg.dataset, seed=cfg.seed)
+        train_records = _limit_records(train_records, cfg.max_train_records, "training")
         if cfg.concept_source != "keywords":
             concept_graph = build_concept_graph(
                 train_records,
@@ -401,13 +414,59 @@ def main() -> None:
     cfg.save(out_dir / "config.json")
 
     if _uses_hf_decoder(cfg):
-        train_ds = HFMedicalReportDataset(cfg.data_root, "train", tokenizer, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed, concept_graph.get("per_record_concepts", {}))
-        valid_ds = HFMedicalReportDataset(cfg.data_root, "valid", tokenizer, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
+        valid_records = load_split_records(cfg.data_root, "valid", dataset=cfg.dataset, seed=cfg.seed)
+        valid_records = _limit_records(valid_records, cfg.max_valid_records, "validation")
+        train_ds = HFMedicalReportDataset(
+            cfg.data_root,
+            "train",
+            tokenizer,
+            concepts,
+            cfg.dataset,
+            cfg.image_size,
+            cfg.max_report_len,
+            cfg.seed,
+            concept_graph.get("per_record_concepts", {}),
+            records=train_records,
+        )
+        valid_ds = HFMedicalReportDataset(
+            cfg.data_root,
+            "valid",
+            tokenizer,
+            concepts,
+            cfg.dataset,
+            cfg.image_size,
+            cfg.max_report_len,
+            cfg.seed,
+            records=valid_records,
+        )
         pad_id, _, _ = _token_ids(tokenizer)
         collate = functools.partial(collate_hf_fn, pad_id=pad_id)
     else:
-        train_ds = MedicalReportDataset(cfg.data_root, "train", vocab, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed, concept_graph.get("per_record_concepts", {}))
-        valid_ds = MedicalReportDataset(cfg.data_root, "valid", vocab, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
+        valid_records = load_split_records(cfg.data_root, "valid", dataset=cfg.dataset, seed=cfg.seed)
+        valid_records = _limit_records(valid_records, cfg.max_valid_records, "validation")
+        train_ds = MedicalReportDataset(
+            cfg.data_root,
+            "train",
+            vocab,
+            concepts,
+            cfg.dataset,
+            cfg.image_size,
+            cfg.max_report_len,
+            cfg.seed,
+            concept_graph.get("per_record_concepts", {}),
+            records=train_records,
+        )
+        valid_ds = MedicalReportDataset(
+            cfg.data_root,
+            "valid",
+            vocab,
+            concepts,
+            cfg.dataset,
+            cfg.image_size,
+            cfg.max_report_len,
+            cfg.seed,
+            records=valid_records,
+        )
         collate = functools.partial(collate_fn, pad_id=vocab.pad_id)
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, collate_fn=collate)
     valid_loader = DataLoader(valid_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=collate)

@@ -18,6 +18,8 @@ class Config:
     min_token_freq: int = 1
     max_vocab_size: int = 12000
     max_concepts: int = 128
+    max_train_records: int | None = None
+    max_valid_records: int | None = None
     concept_source: str = "hybrid"
     radgraph_path: str | None = None
     concept_normalizer: str = "rules"
