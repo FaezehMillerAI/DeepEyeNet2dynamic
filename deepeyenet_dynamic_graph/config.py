@@ -48,6 +48,7 @@ class Config:
     generation_no_repeat_ngram_size: int = 3
     generation_repetition_penalty: float = 1.15
     generation_length_penalty: float = 1.0
+    decoder_concept_evidence_topk: int = 12
     progress_style: str = "epoch"
     dropout: float = 0.2
     batch_size: int = 8

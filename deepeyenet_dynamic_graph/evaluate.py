@@ -60,6 +60,7 @@ def _generation_kwargs(cfg: Config) -> dict:
         "no_repeat_ngram_size": cfg.generation_no_repeat_ngram_size,
         "repetition_penalty": cfg.generation_repetition_penalty,
         "length_penalty": cfg.generation_length_penalty,
+        "concept_evidence_topk": cfg.decoder_concept_evidence_topk,
     }
 
 
@@ -244,9 +245,9 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
             attention_mask = attention_mask.to(device)
         output, gen_tokens = model.generate(images, max_len=cfg.max_report_len, **_generation_kwargs(cfg))
         if attention_mask is not None:
-            teacher_output = model(images, tokens, attention_mask=attention_mask)
+            teacher_output = model(images, tokens, attention_mask=attention_mask, concept_targets=batch["concept_targets"].to(device))
         else:
-            teacher_output = model(images, tokens)
+            teacher_output = model(images, tokens, concept_targets=batch["concept_targets"].to(device))
         raw_pred_texts = [_decode_text(text_decoder, row.tolist()) for row in gen_tokens.cpu()]
 
         probs = torch.sigmoid(teacher_output.concept_logits)

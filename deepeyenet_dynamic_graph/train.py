@@ -64,6 +64,7 @@ def parse_args() -> Config:
     parser.add_argument("--generation-no-repeat-ngram-size", type=int, default=3)
     parser.add_argument("--generation-repetition-penalty", type=float, default=1.15)
     parser.add_argument("--generation-length-penalty", type=float, default=1.0)
+    parser.add_argument("--decoder-concept-evidence-topk", type=int, default=12)
     parser.add_argument("--progress-style", choices=["epoch", "batch", "none"], default="epoch")
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
@@ -112,6 +113,7 @@ def parse_args() -> Config:
         generation_no_repeat_ngram_size=args.generation_no_repeat_ngram_size,
         generation_repetition_penalty=args.generation_repetition_penalty,
         generation_length_penalty=args.generation_length_penalty,
+        decoder_concept_evidence_topk=args.decoder_concept_evidence_topk,
         progress_style=args.progress_style,
         device=args.device,
     )
@@ -266,9 +268,9 @@ def run_epoch(model, loader, optimizer, cfg: Config, device: torch.device, train
             coverage_token_ids = coverage_token_ids.to(device)
         with torch.set_grad_enabled(train):
             if attention_mask is not None:
-                output = model(images, tokens, attention_mask=attention_mask)
+                output = model(images, tokens, attention_mask=attention_mask, concept_targets=concept_targets)
             else:
-                output = model(images, tokens)
+                output = model(images, tokens, concept_targets=concept_targets)
             loss, parts = compute_losses(
                 output,
                 tokens,

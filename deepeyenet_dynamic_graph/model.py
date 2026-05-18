@@ -443,6 +443,7 @@ class DynamicGraphCaptioner(nn.Module):
         self,
         images: torch.Tensor,
         tokens: torch.Tensor,
+        concept_targets: torch.Tensor | None = None,
         suppress_anatomy_ids: torch.Tensor | None = None,
         suppress_concept_ids: torch.Tensor | None = None,
     ) -> DecodeOutput:
@@ -733,6 +734,7 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         images: torch.Tensor,
         tokens: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        concept_targets: torch.Tensor | None = None,
         suppress_anatomy_ids: torch.Tensor | None = None,
         suppress_concept_ids: torch.Tensor | None = None,
     ) -> DecodeOutput:
@@ -881,6 +883,27 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         if prompt_ids.numel() == 0:
             prompt_ids = torch.tensor([int(pad_id if pad_id is not None else fallback_id)], dtype=torch.long)
         self.register_buffer("encoder_prompt_ids", prompt_ids.long(), persistent=False)
+        concept_token_rows: list[list[int]] = []
+        special_ids = {
+            idx
+            for idx in [tokenizer.pad_token_id, tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.unk_token_id]
+            if idx is not None
+        }
+        max_concept_tokens = 1
+        for concept in concept_names:
+            ids = tokenizer(f" finding: {concept}", add_special_tokens=False).input_ids
+            ids = [int(idx) for idx in ids if int(idx) not in special_ids]
+            if not ids:
+                ids = [int(pad_id if pad_id is not None else fallback_id)]
+            concept_token_rows.append(ids)
+            max_concept_tokens = max(max_concept_tokens, len(ids))
+        concept_token_ids = torch.full((len(concept_token_rows), max_concept_tokens), int(self.pad_id), dtype=torch.long)
+        concept_token_mask = torch.zeros((len(concept_token_rows), max_concept_tokens), dtype=torch.float32)
+        for idx, ids in enumerate(concept_token_rows):
+            concept_token_ids[idx, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+            concept_token_mask[idx, : len(ids)] = 1.0
+        self.register_buffer("concept_name_token_ids", concept_token_ids, persistent=False)
+        self.register_buffer("concept_name_token_mask", concept_token_mask, persistent=False)
         self.register_buffer(
             "concept_token_mask",
             _build_concept_token_mask(tokenizer, concept_names, int(self.llm.config.vocab_size)),
@@ -890,6 +913,11 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         self.prefix_offset = nn.Parameter(torch.randn(prefix_length, self.llm_dim) * 0.02)
         self.prefix_proj = nn.Sequential(
             nn.Linear(embed_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.llm_dim),
+        )
+        self.concept_evidence_proj = nn.Sequential(
+            nn.Linear(embed_dim + self.llm_dim + 1, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, self.llm_dim),
         )
@@ -951,12 +979,61 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         prefix = self.prefix_proj(base).unsqueeze(1).expand(batch, self.prefix_length, self.llm_dim)
         return prefix + self.prefix_offset.unsqueeze(0)
 
-    def _encoder_inputs(self, prefix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _concept_name_embeddings(self, concept_ids: torch.Tensor) -> torch.Tensor:
+        flat_ids = concept_ids.reshape(-1)
+        token_ids = self.concept_name_token_ids.to(concept_ids.device)[flat_ids]
+        token_mask = self.concept_name_token_mask.to(concept_ids.device, dtype=torch.float32)[flat_ids]
+        token_embeds = self.llm.get_input_embeddings()(token_ids)
+        pooled = (token_embeds * token_mask.unsqueeze(-1)).sum(dim=1) / token_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        return pooled.reshape(*concept_ids.shape, self.llm_dim)
+
+    def _concept_evidence_tokens(
+        self,
+        concept_features: torch.Tensor,
+        concept_logits: torch.Tensor,
+        concept_targets: torch.Tensor | None = None,
+        top_k: int = 12,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch, num_concepts, _ = concept_features.shape
+        k = max(1, min(int(top_k), num_concepts))
+        pred_scores = torch.sigmoid(concept_logits)
+        if concept_targets is not None:
+            scores = torch.maximum(pred_scores.detach() * 0.35, concept_targets.to(pred_scores.device, pred_scores.dtype))
+        else:
+            scores = pred_scores
+        values, ids = torch.topk(scores, k=k, dim=-1)
+        gathered_features = torch.gather(concept_features, 1, ids.unsqueeze(-1).expand(-1, -1, concept_features.shape[-1]))
+        name_embeds = self._concept_name_embeddings(ids)
+        evidence_inputs = torch.cat([gathered_features, name_embeds, values.unsqueeze(-1)], dim=-1)
+        evidence = self.concept_evidence_proj(evidence_inputs)
+        evidence = evidence + name_embeds
+        mask = (values > 0.03).long()
+        empty_rows = mask.sum(dim=1) == 0
+        if bool(empty_rows.any()):
+            mask[empty_rows, : min(3, k)] = 1
+        return evidence, mask
+
+    def _encoder_inputs(
+        self,
+        prefix: torch.Tensor,
+        concept_features: torch.Tensor,
+        concept_logits: torch.Tensor,
+        concept_targets: torch.Tensor | None = None,
+        concept_evidence_topk: int = 12,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch = prefix.shape[0]
         prompt_ids = self.encoder_prompt_ids.to(prefix.device).unsqueeze(0).expand(batch, -1)
         prompt_embeds = self.llm.get_input_embeddings()(prompt_ids)
-        inputs_embeds = torch.cat([prefix, prompt_embeds], dim=1)
-        attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=prefix.device)
+        concept_embeds, concept_mask = self._concept_evidence_tokens(
+            concept_features,
+            concept_logits,
+            concept_targets=concept_targets,
+            top_k=concept_evidence_topk,
+        )
+        inputs_embeds = torch.cat([prefix, concept_embeds, prompt_embeds], dim=1)
+        prefix_mask = torch.ones(batch, self.prefix_length, dtype=torch.long, device=prefix.device)
+        prompt_mask = torch.ones(prompt_ids.shape, dtype=torch.long, device=prefix.device)
+        attention_mask = torch.cat([prefix_mask, concept_mask, prompt_mask], dim=1)
         return inputs_embeds, attention_mask
 
     def _graph_forward(
@@ -1004,6 +1081,8 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         images: torch.Tensor,
         tokens: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        concept_targets: torch.Tensor | None = None,
+        concept_evidence_topk: int = 12,
         suppress_anatomy_ids: torch.Tensor | None = None,
         suppress_concept_ids: torch.Tensor | None = None,
     ) -> DecodeOutput:
@@ -1012,7 +1091,14 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         )
         if attention_mask is None:
             attention_mask = (tokens != self.pad_id).long()
-        encoder_inputs, encoder_mask = self._encoder_inputs(prefix)
+        concept_logits = self.concept_head(concept_features).squeeze(-1)
+        encoder_inputs, encoder_mask = self._encoder_inputs(
+            prefix,
+            concept_features,
+            concept_logits,
+            concept_targets=concept_targets,
+            concept_evidence_topk=concept_evidence_topk,
+        )
         labels = tokens.clone()
         labels[attention_mask == 0] = -100
         lm_out = self.llm(
@@ -1029,7 +1115,6 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
             region_features,
             concept_features,
         )
-        concept_logits = self.concept_head(concept_features).squeeze(-1)
         logits = self._apply_concept_logit_bias(lm_out.logits, token_concept, concept_logits)
         return DecodeOutput(
             logits,
@@ -1054,11 +1139,18 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         no_repeat_ngram_size: int = 3,
         repetition_penalty: float = 1.15,
         length_penalty: float = 1.0,
+        concept_evidence_topk: int = 12,
     ) -> tuple[DecodeOutput, torch.Tensor]:
         prefix, region_features, ra_edges, ac_edges, anatomy_features, concept_features = self._graph_forward(images)
         batch = images.shape[0]
-        encoder_inputs, encoder_mask = self._encoder_inputs(prefix)
         concept_logits = self.concept_head(concept_features).squeeze(-1)
+        encoder_inputs, encoder_mask = self._encoder_inputs(
+            prefix,
+            concept_features,
+            concept_logits,
+            concept_targets=None,
+            concept_evidence_topk=concept_evidence_topk,
+        )
         gen_tokens = self.llm.generate(
             inputs_embeds=encoder_inputs,
             attention_mask=encoder_mask,
