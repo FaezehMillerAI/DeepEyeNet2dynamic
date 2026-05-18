@@ -14,6 +14,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+from tqdm.auto import tqdm
 
 from .vocab import Vocabulary, build_concepts, build_vocab, normalize_concept
 
@@ -575,6 +576,7 @@ def _resolve_mimic_image_paths(row: pd.Series, data_root: Path, image_index: dic
 def load_mimic_cxr_split_records(data_root: str | Path, split: str, seed: int = 42) -> list[dict[str, Any]]:
     data_root = Path(data_root)
     csv_path, split_validate = _find_mimic_csv(data_root, split)
+    print(f"[mimic_cxr:{split}] Reading metadata CSV: {csv_path}", flush=True)
     df = pd.read_csv(csv_path).copy()
     if split_validate:
         rng = random.Random(seed)
@@ -595,9 +597,11 @@ def load_mimic_cxr_split_records(data_root: str | Path, split: str, seed: int = 
 
     image_col = _first_column(df, ["image_path", "path", "img_path", "image", "image_file", "filename", "file", "dicom_path", "jpg_path", "png_path"])
     image_index = None if image_col is not None else _build_mimic_image_index(data_root)
+    print(f"[mimic_cxr:{split}] Resolving {len(df):,} metadata rows into image-report records...", flush=True)
     records: list[dict[str, Any]] = []
     missing_images = 0
-    for _, row in df.iterrows():
+    iterator = tqdm(df.iterrows(), total=len(df), desc=f"mimic metadata {split}", leave=False)
+    for _, row in iterator:
         report = _mimic_report_text(row)
         if not report:
             continue
@@ -621,6 +625,7 @@ def load_mimic_cxr_split_records(data_root: str | Path, split: str, seed: int = 
         warnings.warn(f"Skipped {missing_images} MIMIC-CXR rows because image files could not be resolved under {data_root}.")
     if not records:
         raise ValueError(f"No usable MIMIC-CXR records found from {csv_path} with image root {data_root}.")
+    print(f"[mimic_cxr:{split}] Loaded {len(records):,} image-report records.", flush=True)
     return records
 
 

@@ -320,7 +320,10 @@ def main() -> None:
 
         tokenizer = _prepare_tokenizer(AutoTokenizer.from_pretrained(cfg.llm_name))
         tokenizer.save_pretrained(out_dir)
+        tqdm.write("Loading training metadata and image paths...")
         train_records = load_split_records(cfg.data_root, "train", dataset=cfg.dataset, seed=cfg.seed)
+        tqdm.write(f"Loaded {len(train_records):,} training image-report records.")
+        tqdm.write("Building concept vocabulary and graph priors...")
         if cfg.concept_source == "keywords":
             if cfg.relation_extractor == "none":
                 concepts = build_concepts((r["keywords"] for r in train_records), max_concepts=cfg.max_concepts)
@@ -355,6 +358,7 @@ def main() -> None:
             from .data import infer_concepts_from_reports
             concepts = infer_concepts_from_reports(train_records, max_concepts=cfg.max_concepts)
             concept_graph = {"concepts": concepts, "relations": [], "source": "fallback_report_terms", "normalizer": cfg.concept_normalizer}
+        tqdm.write(f"Built {len(concepts):,} concepts and {len(concept_graph.get('relations', [])):,} graph relations.")
         save_json({"llm_name": cfg.llm_name, "decoder_type": cfg.decoder_type, "pad_token": tokenizer.pad_token, "source": "save_pretrained"}, out_dir / "tokenizer_meta.json")
         vocab = None
     else:
