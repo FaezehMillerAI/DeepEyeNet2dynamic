@@ -4,6 +4,7 @@ import json
 import re
 import warnings
 import random
+import ast
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable
@@ -487,26 +488,79 @@ def _relative_or_absolute(path: Path, data_root: Path) -> str:
         return str(path)
 
 
-def _resolve_mimic_image_path(row: pd.Series, data_root: Path, image_index: dict[str, Path] | None = None) -> str | None:
+def _mimic_path_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    try:
+        if pd.isna(value):
+            return []
+    except Exception:
+        pass
+    if isinstance(value, (list, tuple, set)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    raw = str(value).strip()
+    if not raw:
+        return []
+    if raw.startswith("[") and raw.endswith("]"):
+        try:
+            parsed = ast.literal_eval(raw)
+            if isinstance(parsed, (list, tuple, set)):
+                return [str(v).strip() for v in parsed if str(v).strip()]
+        except Exception:
+            pass
+    if "|" in raw:
+        return [part.strip() for part in raw.split("|") if part.strip()]
+    return [raw]
+
+
+def _path_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def _resolve_mimic_image_paths(row: pd.Series, data_root: Path, image_index: dict[str, Path] | None = None) -> list[str]:
     lower_to_col = {str(col).lower().strip(): col for col in row.index}
-    path_cols = ["image_path", "path", "img_path", "image", "image_file", "filename", "file", "dicom_path", "jpg_path", "png_path"]
+    path_cols = [
+        "image_path",
+        "image_paths",
+        "path",
+        "paths",
+        "img_path",
+        "img_paths",
+        "image",
+        "images",
+        "image_file",
+        "image_files",
+        "filename",
+        "filenames",
+        "file",
+        "files",
+        "dicom_path",
+        "jpg_path",
+        "png_path",
+    ]
     search_roots = [data_root, data_root.parent]
+    resolved: list[str] = []
     for name in path_cols:
         col = lower_to_col.get(name)
-        if col is None or pd.isna(row.get(col)):
+        if col is None:
             continue
-        raw = str(row.get(col)).strip()
-        if not raw:
-            continue
-        raw_path = Path(raw)
-        candidates = [raw_path] if raw_path.is_absolute() else [root / raw_path for root in search_roots]
-        for candidate in candidates:
-            if candidate.exists():
-                return _relative_or_absolute(candidate, data_root)
-        if image_index:
-            match = image_index.get(raw_path.name) or image_index.get(raw_path.stem)
-            if match is not None:
-                return _relative_or_absolute(match, data_root)
+        for raw in _mimic_path_values(row.get(col)):
+            raw_path = Path(raw)
+            candidates = [raw_path] if raw_path.is_absolute() else [root / raw_path for root in search_roots]
+            for candidate in candidates:
+                if _path_exists(candidate):
+                    resolved.append(_relative_or_absolute(candidate, data_root))
+                    break
+            else:
+                if image_index:
+                    match = image_index.get(raw_path.name) or image_index.get(raw_path.stem)
+                    if match is not None:
+                        resolved.append(_relative_or_absolute(match, data_root))
+        if resolved:
+            return sorted(set(resolved))
     for name in ["dicom_id", "image_id", "imageid", "study_id", "studyid"]:
         col = lower_to_col.get(name)
         if col is not None and not pd.isna(row.get(col)):
@@ -514,8 +568,8 @@ def _resolve_mimic_image_path(row: pd.Series, data_root: Path, image_index: dict
             if image_index and key:
                 match = image_index.get(key) or image_index.get(Path(key).stem)
                 if match is not None:
-                    return _relative_or_absolute(match, data_root)
-    return None
+                    return [_relative_or_absolute(match, data_root)]
+    return []
 
 
 def load_mimic_cxr_split_records(data_root: str | Path, split: str, seed: int = 42) -> list[dict[str, Any]]:
@@ -547,21 +601,22 @@ def load_mimic_cxr_split_records(data_root: str | Path, split: str, seed: int = 
         report = _mimic_report_text(row)
         if not report:
             continue
-        image_path = _resolve_mimic_image_path(row, data_root, image_index=image_index)
-        if image_path is None:
+        image_paths = _resolve_mimic_image_paths(row, data_root, image_index=image_index)
+        if not image_paths:
             missing_images += 1
             continue
         keywords = _mimic_keywords(row, report)
-        uid = row.get("study_id", row.get("StudyID", row.get("dicom_id", image_path)))
-        records.append(
-            {
-                "image_path": image_path,
-                "keywords": keywords,
-                "clinical_description": report,
-                "report_text": report,
-                "uid": str(uid),
-            }
-        )
+        uid = row.get("study_id", row.get("StudyID", row.get("dicom_id", image_paths[0])))
+        for image_path in image_paths:
+            records.append(
+                {
+                    "image_path": image_path,
+                    "keywords": keywords,
+                    "clinical_description": report,
+                    "report_text": report,
+                    "uid": str(uid),
+                }
+            )
     if missing_images:
         warnings.warn(f"Skipped {missing_images} MIMIC-CXR rows because image files could not be resolved under {data_root}.")
     if not records:
