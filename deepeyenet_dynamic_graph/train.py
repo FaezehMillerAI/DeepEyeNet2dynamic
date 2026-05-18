@@ -59,6 +59,7 @@ def parse_args() -> Config:
     parser.add_argument("--no-report-memory", action="store_true")
     parser.add_argument("--report-memory-max-entries", type=int, default=2500)
     parser.add_argument("--report-memory-min-score", type=float, default=0.05)
+    parser.add_argument("--progress-style", choices=["epoch", "batch", "none"], default="epoch")
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
     cfg = Config(
@@ -101,6 +102,7 @@ def parse_args() -> Config:
         use_report_memory=not args.no_report_memory,
         report_memory_max_entries=args.report_memory_max_entries,
         report_memory_min_score=args.report_memory_min_score,
+        progress_style=args.progress_style,
         device=args.device,
     )
     return cfg
@@ -240,7 +242,8 @@ def run_epoch(model, loader, optimizer, cfg: Config, device: torch.device, train
     totals: dict[str, float] = {}
     n = 0
     stage = "train" if train else "valid"
-    iterator = tqdm(loader, desc=f"{stage} {epoch}/{cfg.epochs}", leave=True, dynamic_ncols=True, smoothing=0.05)
+    use_batch_bar = cfg.progress_style == "batch"
+    iterator = tqdm(loader, desc=f"{stage} {epoch}/{cfg.epochs}", leave=False, dynamic_ncols=True, smoothing=0.05) if use_batch_bar else loader
     for batch in iterator:
         images = batch["image"].to(device)
         tokens = batch["tokens"].to(device)
@@ -277,7 +280,8 @@ def run_epoch(model, loader, optimizer, cfg: Config, device: torch.device, train
         n += bs
         for key, val in parts.items():
             totals[key] = totals.get(key, 0.0) + val * bs
-        iterator.set_postfix(_progress_postfix(totals, n))
+        if use_batch_bar:
+            iterator.set_postfix(_progress_postfix(totals, n))
     return {k: v / max(1, n) for k, v in totals.items()}
 
 
@@ -384,7 +388,12 @@ def main() -> None:
     valid_loader = DataLoader(valid_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=collate)
     tqdm.write(f"Train examples: {len(train_ds):,} | valid examples: {len(valid_ds):,}")
     tqdm.write(f"Train batches: {len(train_loader):,} | valid batches: {len(valid_loader):,}")
-    tqdm.write("Live progress: batch bars show rolling epoch averages. Artifacts update after each epoch.")
+    if cfg.progress_style == "batch":
+        tqdm.write("Live progress: batch bars show rolling epoch averages. Artifacts update after each epoch.")
+    elif cfg.progress_style == "epoch":
+        tqdm.write("Live progress: one epoch bar plus one summary per epoch. Artifacts update after each epoch.")
+    else:
+        tqdm.write("Live progress bars disabled. Artifacts update after each epoch.")
 
     if _uses_hf_decoder(cfg):
         model = _build_hf_model(cfg, tokenizer, concepts, concept_graph).to(device)
@@ -413,7 +422,8 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     best = float("inf")
     history = []
-    epoch_bar = tqdm(range(1, cfg.epochs + 1), desc="epochs", dynamic_ncols=True)
+    epoch_iter = range(1, cfg.epochs + 1)
+    epoch_bar = tqdm(epoch_iter, desc="epochs", dynamic_ncols=True) if cfg.progress_style != "none" else epoch_iter
     for epoch in epoch_bar:
         train_metrics = run_epoch(model, train_loader, optimizer, cfg, device, train=True, epoch=epoch)
         valid_metrics = run_epoch(model, valid_loader, optimizer, cfg, device, train=False, epoch=epoch)
@@ -433,7 +443,8 @@ def main() -> None:
             best = valid_metrics["loss"]
             torch.save({"model": model.state_dict(), "config": cfg.to_dict()}, out_dir / "best_model.pt")
             tqdm.write(f"New best validation loss: {best:.4f}; checkpoint saved.")
-        epoch_bar.set_postfix(best=f"{best:.4f}", valid=f"{valid_metrics['loss']:.4f}")
+        if cfg.progress_style != "none":
+            epoch_bar.set_postfix(best=f"{best:.4f}", valid=f"{valid_metrics['loss']:.4f}")
     print(f"Best validation loss: {best:.4f}")
     print(f"Saved checkpoint to {Path(out_dir) / 'best_model.pt'}")
     print(f"Saved training plot to {Path(out_dir) / 'training_progress.png'}")

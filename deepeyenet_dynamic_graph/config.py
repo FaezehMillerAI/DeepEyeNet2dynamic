@@ -43,6 +43,7 @@ class Config:
     use_report_memory: bool = True
     report_memory_max_entries: int = 2500
     report_memory_min_score: float = 0.05
+    progress_style: str = "epoch"
     dropout: float = 0.2
     batch_size: int = 8
     epochs: int = 15
