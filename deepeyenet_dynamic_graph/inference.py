@@ -25,6 +25,7 @@ def parse_args():
     parser.add_argument("--generation-repetition-penalty", type=float, default=None)
     parser.add_argument("--generation-length-penalty", type=float, default=None)
     parser.add_argument("--decoder-concept-evidence-topk", type=int, default=None)
+    parser.add_argument("--decoder-region-evidence-topk", type=int, default=None)
     parser.add_argument("--no-report-memory", action="store_true")
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
@@ -46,6 +47,7 @@ def _generation_kwargs(cfg: Config) -> dict:
         "repetition_penalty": cfg.generation_repetition_penalty,
         "length_penalty": cfg.generation_length_penalty,
         "concept_evidence_topk": cfg.decoder_concept_evidence_topk,
+        "region_evidence_topk": cfg.decoder_region_evidence_topk,
     }
 
 
@@ -136,6 +138,8 @@ def main() -> None:
         cfg.generation_length_penalty = args.generation_length_penalty
     if args.decoder_concept_evidence_topk is not None:
         cfg.decoder_concept_evidence_topk = args.decoder_concept_evidence_topk
+    if args.decoder_region_evidence_topk is not None:
+        cfg.decoder_region_evidence_topk = args.decoder_region_evidence_topk
     concepts = load_json(run_dir / "concepts.json")["concepts"]
     concept_graph_path = run_dir / "concept_graph.json"
     concept_graph = load_json(concept_graph_path) if concept_graph_path.exists() else None

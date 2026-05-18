@@ -332,6 +332,10 @@ class DynamicGraphCaptioner(nn.Module):
         self.anatomy_proj = nn.Linear(embed_dim, embed_dim)
         self.concept_proj = nn.Linear(embed_dim, embed_dim)
         self.graph_msg = nn.Linear(embed_dim, embed_dim)
+        self.concept_graph_norm = nn.LayerNorm(embed_dim)
+        self.anatomy_graph_norm = nn.LayerNorm(embed_dim)
+        self.concept_msg_gate = nn.Sequential(nn.Linear(embed_dim * 2, embed_dim), nn.Sigmoid())
+        self.anatomy_msg_gate = nn.Sequential(nn.Linear(embed_dim * 2, embed_dim), nn.Sigmoid())
         self.init_hidden = nn.Linear(embed_dim, hidden_dim)
         self.decoder = nn.GRUCell(embed_dim + embed_dim + embed_dim, hidden_dim)
         self.hidden_to_graph = nn.Linear(hidden_dim, embed_dim)
@@ -404,7 +408,9 @@ class DynamicGraphCaptioner(nn.Module):
                 ra_edges = self.compute_region_anatomy_edges(region_features, anatomy_features)
                 assert ra_edges is not None
                 anatomy_msg = torch.matmul(ra_edges.transpose(1, 2), region_features) / max(1, region_features.shape[1])
-                anatomy_features = F.gelu(anatomy_features + self.graph_msg(anatomy_msg))
+                anatomy_delta = F.gelu(self.graph_msg(anatomy_msg))
+                anatomy_gate = self.anatomy_msg_gate(torch.cat([anatomy_features, anatomy_delta], dim=-1))
+                anatomy_features = self.anatomy_graph_norm(anatomy_features + anatomy_gate * anatomy_delta)
                 if suppress_anatomy_ids is not None:
                     anatomy_features = anatomy_features.clone()
                     for b, anatomy_id in enumerate(suppress_anatomy_ids.tolist()):
@@ -413,7 +419,9 @@ class DynamicGraphCaptioner(nn.Module):
                 assert ra_edges is not None
                 ac_edges = self.compute_anatomy_concept_edges(anatomy_features, concept_features)
                 concept_msg = torch.matmul(ac_edges.transpose(1, 2), anatomy_features) / max(1, self.num_anatomy)
-                concept_features = F.gelu(concept_features + self.graph_msg(concept_msg))
+                concept_delta = F.gelu(self.graph_msg(concept_msg))
+                concept_gate = self.concept_msg_gate(torch.cat([concept_features, concept_delta], dim=-1))
+                concept_features = self.concept_graph_norm(concept_features + concept_gate * concept_delta)
                 rc_edges = torch.matmul(ra_edges, ac_edges)
         else:
             ra_edges = None
@@ -424,7 +432,9 @@ class DynamicGraphCaptioner(nn.Module):
             for _ in range(steps):
                 rc_edges = self.compute_region_concept_edges(region_features, concept_features)
                 concept_msg = torch.matmul(rc_edges.transpose(1, 2), region_features) / max(1, region_features.shape[1])
-                concept_features = F.gelu(concept_features + self.graph_msg(concept_msg))
+                concept_delta = F.gelu(self.graph_msg(concept_msg))
+                concept_gate = self.concept_msg_gate(torch.cat([concept_features, concept_delta], dim=-1))
+                concept_features = self.concept_graph_norm(concept_features + concept_gate * concept_delta)
         if suppress_concept_ids is not None:
             concept_features = concept_features.clone()
             for b, concept_id in enumerate(suppress_concept_ids.tolist()):
@@ -735,6 +745,8 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         tokens: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         concept_targets: torch.Tensor | None = None,
+        concept_evidence_topk: int = 12,
+        region_evidence_topk: int = 8,
         suppress_anatomy_ids: torch.Tensor | None = None,
         suppress_concept_ids: torch.Tensor | None = None,
     ) -> DecodeOutput:
@@ -921,6 +933,16 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
             nn.GELU(),
             nn.Linear(hidden_dim, self.llm_dim),
         )
+        self.region_evidence_proj = nn.Sequential(
+            nn.Linear(embed_dim * 2 + 1, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.llm_dim),
+        )
+        self.anatomy_evidence_proj = nn.Sequential(
+            nn.Linear(embed_dim * 2 + 1, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.llm_dim),
+        )
         self.llm_state_to_graph = nn.Linear(self.llm_dim, embed_dim)
         decoder_start = getattr(self.llm.config, "decoder_start_token_id", None)
         self.decoder_start_id = int(decoder_start if decoder_start is not None else self.bos_id)
@@ -1013,27 +1035,106 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
             mask[empty_rows, : min(3, k)] = 1
         return evidence, mask
 
+    def _region_evidence_tokens(
+        self,
+        region_features: torch.Tensor,
+        concept_features: torch.Tensor,
+        rc_edges: torch.Tensor,
+        concept_logits: torch.Tensor,
+        concept_targets: torch.Tensor | None = None,
+        top_k: int = 8,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch, num_regions, _ = region_features.shape
+        k = max(1, min(int(top_k), num_regions))
+        concept_scores = torch.sigmoid(concept_logits)
+        if concept_targets is not None:
+            concept_scores = torch.maximum(
+                concept_scores.detach() * 0.35,
+                concept_targets.to(concept_scores.device, concept_scores.dtype),
+            )
+        region_concept = rc_edges * concept_scores.unsqueeze(1)
+        region_scores = region_concept.max(dim=-1).values
+        values, ids = torch.topk(region_scores, k=k, dim=-1)
+        gathered_regions = torch.gather(region_features, 1, ids.unsqueeze(-1).expand(-1, -1, region_features.shape[-1]))
+        concept_context_all = torch.matmul(rc_edges, concept_features)
+        gathered_context = torch.gather(concept_context_all, 1, ids.unsqueeze(-1).expand(-1, -1, concept_features.shape[-1]))
+        evidence_inputs = torch.cat([gathered_regions, gathered_context, values.unsqueeze(-1)], dim=-1)
+        evidence = self.region_evidence_proj(evidence_inputs)
+        mask = (values > 0.01).long()
+        empty_rows = mask.sum(dim=1) == 0
+        if bool(empty_rows.any()):
+            mask[empty_rows, : min(2, k)] = 1
+        return evidence, mask
+
+    def _anatomy_evidence_tokens(
+        self,
+        anatomy_features: torch.Tensor | None,
+        concept_features: torch.Tensor,
+        anatomy_concept_edges: torch.Tensor | None,
+        concept_logits: torch.Tensor,
+        concept_targets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if anatomy_features is None or anatomy_concept_edges is None or anatomy_features.shape[1] == 0:
+            return None, None
+        concept_scores = torch.sigmoid(concept_logits)
+        if concept_targets is not None:
+            concept_scores = torch.maximum(
+                concept_scores.detach() * 0.35,
+                concept_targets.to(concept_scores.device, concept_scores.dtype),
+            )
+        anatomy_scores = (anatomy_concept_edges * concept_scores.unsqueeze(1)).max(dim=-1).values
+        concept_context = torch.matmul(anatomy_concept_edges, concept_features)
+        evidence_inputs = torch.cat([anatomy_features, concept_context, anatomy_scores.unsqueeze(-1)], dim=-1)
+        evidence = self.anatomy_evidence_proj(evidence_inputs)
+        mask = torch.ones(anatomy_features.shape[:2], dtype=torch.long, device=anatomy_features.device)
+        return evidence, mask
+
     def _encoder_inputs(
         self,
         prefix: torch.Tensor,
+        region_features: torch.Tensor,
         concept_features: torch.Tensor,
+        anatomy_features: torch.Tensor | None,
+        rc_edges: torch.Tensor,
+        anatomy_concept_edges: torch.Tensor | None,
         concept_logits: torch.Tensor,
         concept_targets: torch.Tensor | None = None,
         concept_evidence_topk: int = 12,
+        region_evidence_topk: int = 8,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch = prefix.shape[0]
         prompt_ids = self.encoder_prompt_ids.to(prefix.device).unsqueeze(0).expand(batch, -1)
         prompt_embeds = self.llm.get_input_embeddings()(prompt_ids)
+        region_embeds, region_mask = self._region_evidence_tokens(
+            region_features,
+            concept_features,
+            rc_edges,
+            concept_logits,
+            concept_targets=concept_targets,
+            top_k=region_evidence_topk,
+        )
+        anatomy_embeds, anatomy_mask = self._anatomy_evidence_tokens(
+            anatomy_features,
+            concept_features,
+            anatomy_concept_edges,
+            concept_logits,
+            concept_targets=concept_targets,
+        )
         concept_embeds, concept_mask = self._concept_evidence_tokens(
             concept_features,
             concept_logits,
             concept_targets=concept_targets,
             top_k=concept_evidence_topk,
         )
-        inputs_embeds = torch.cat([prefix, concept_embeds, prompt_embeds], dim=1)
-        prefix_mask = torch.ones(batch, self.prefix_length, dtype=torch.long, device=prefix.device)
-        prompt_mask = torch.ones(prompt_ids.shape, dtype=torch.long, device=prefix.device)
-        attention_mask = torch.cat([prefix_mask, concept_mask, prompt_mask], dim=1)
+        evidence_parts = [prefix, region_embeds]
+        mask_parts = [torch.ones(batch, self.prefix_length, dtype=torch.long, device=prefix.device), region_mask]
+        if anatomy_embeds is not None and anatomy_mask is not None:
+            evidence_parts.append(anatomy_embeds)
+            mask_parts.append(anatomy_mask)
+        evidence_parts.extend([concept_embeds, prompt_embeds])
+        mask_parts.extend([concept_mask, torch.ones(prompt_ids.shape, dtype=torch.long, device=prefix.device)])
+        inputs_embeds = torch.cat(evidence_parts, dim=1)
+        attention_mask = torch.cat(mask_parts, dim=1)
         return inputs_embeds, attention_mask
 
     def _graph_forward(
@@ -1083,6 +1184,7 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         attention_mask: torch.Tensor | None = None,
         concept_targets: torch.Tensor | None = None,
         concept_evidence_topk: int = 12,
+        region_evidence_topk: int = 8,
         suppress_anatomy_ids: torch.Tensor | None = None,
         suppress_concept_ids: torch.Tensor | None = None,
     ) -> DecodeOutput:
@@ -1092,12 +1194,18 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         if attention_mask is None:
             attention_mask = (tokens != self.pad_id).long()
         concept_logits = self.concept_head(concept_features).squeeze(-1)
+        rc_current = torch.matmul(ra_edges, ac_edges) if ra_edges is not None and ac_edges is not None else self.compute_region_concept_edges(region_features, concept_features)
         encoder_inputs, encoder_mask = self._encoder_inputs(
             prefix,
+            region_features,
             concept_features,
+            anatomy_features,
+            rc_current,
+            ac_edges,
             concept_logits,
             concept_targets=concept_targets,
             concept_evidence_topk=concept_evidence_topk,
+            region_evidence_topk=region_evidence_topk,
         )
         labels = tokens.clone()
         labels[attention_mask == 0] = -100
@@ -1140,16 +1248,23 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         repetition_penalty: float = 1.15,
         length_penalty: float = 1.0,
         concept_evidence_topk: int = 12,
+        region_evidence_topk: int = 8,
     ) -> tuple[DecodeOutput, torch.Tensor]:
         prefix, region_features, ra_edges, ac_edges, anatomy_features, concept_features = self._graph_forward(images)
         batch = images.shape[0]
         concept_logits = self.concept_head(concept_features).squeeze(-1)
+        rc_current = torch.matmul(ra_edges, ac_edges) if ra_edges is not None and ac_edges is not None else self.compute_region_concept_edges(region_features, concept_features)
         encoder_inputs, encoder_mask = self._encoder_inputs(
             prefix,
+            region_features,
             concept_features,
+            anatomy_features,
+            rc_current,
+            ac_edges,
             concept_logits,
             concept_targets=None,
             concept_evidence_topk=concept_evidence_topk,
+            region_evidence_topk=region_evidence_topk,
         )
         gen_tokens = self.llm.generate(
             inputs_embeds=encoder_inputs,

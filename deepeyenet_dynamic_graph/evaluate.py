@@ -61,6 +61,7 @@ def _generation_kwargs(cfg: Config) -> dict:
         "repetition_penalty": cfg.generation_repetition_penalty,
         "length_penalty": cfg.generation_length_penalty,
         "concept_evidence_topk": cfg.decoder_concept_evidence_topk,
+        "region_evidence_topk": cfg.decoder_region_evidence_topk,
     }
 
 
@@ -245,7 +246,14 @@ def evaluate_model(model, loader, text_decoder, concepts: list[str], cfg: Config
             attention_mask = attention_mask.to(device)
         output, gen_tokens = model.generate(images, max_len=cfg.max_report_len, **_generation_kwargs(cfg))
         if attention_mask is not None:
-            teacher_output = model(images, tokens, attention_mask=attention_mask, concept_targets=batch["concept_targets"].to(device))
+            teacher_output = model(
+                images,
+                tokens,
+                attention_mask=attention_mask,
+                concept_targets=batch["concept_targets"].to(device),
+                concept_evidence_topk=cfg.decoder_concept_evidence_topk,
+                region_evidence_topk=cfg.decoder_region_evidence_topk,
+            )
         else:
             teacher_output = model(images, tokens, concept_targets=batch["concept_targets"].to(device))
         raw_pred_texts = [_decode_text(text_decoder, row.tolist()) for row in gen_tokens.cpu()]
