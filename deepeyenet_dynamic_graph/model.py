@@ -42,7 +42,7 @@ def _hf_decoder_load_kwargs(
         "bfloat16": torch.bfloat16,
     }
     if torch_dtype:
-        kwargs["torch_dtype"] = dtype_map.get(str(torch_dtype).lower(), torch_dtype)
+        kwargs["dtype"] = dtype_map.get(str(torch_dtype).lower(), torch_dtype)
     if attn_implementation:
         kwargs["attn_implementation"] = attn_implementation
     return kwargs

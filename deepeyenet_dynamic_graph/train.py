@@ -339,6 +339,14 @@ def run_epoch(model, loader, optimizer, cfg: Config, device: torch.device, train
                 cfg.lambda_sparse,
                 cfg.lambda_temp,
             )
+            if not torch.isfinite(loss):
+                details = " ".join(f"{key}={val}" for key, val in parts.items())
+                raise RuntimeError(
+                    "Non-finite training loss encountered. "
+                    "If you are using a T5/FLAN-T5/SciFive decoder with --llm-dtype float16, "
+                    "rerun with --llm-dtype float32, or use bfloat16 on GPUs that support it. "
+                    f"Loss parts: {details}"
+                )
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -573,7 +581,11 @@ def main() -> None:
         if cfg.progress_style not in {"none", "single"}:
             epoch_bar.set_postfix(best=f"{best:.4f}", valid=f"{valid_metrics['loss']:.4f}")
     print(f"Best validation loss: {best:.4f}")
-    print(f"Saved checkpoint to {Path(out_dir) / 'best_model.pt'}")
+    checkpoint_path = Path(out_dir) / "best_model.pt"
+    if checkpoint_path.exists():
+        print(f"Saved checkpoint to {checkpoint_path}")
+    else:
+        print("No checkpoint was saved because validation loss never became finite.")
     print(f"Saved training plot to {Path(out_dir) / 'training_progress.png'}")
     print(f"Saved training CSV to {Path(out_dir) / 'training_progress.csv'}")
 
