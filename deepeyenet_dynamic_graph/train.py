@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import csv
 import functools
+import sys
+import time
 from pathlib import Path
 
 import torch
@@ -72,7 +74,8 @@ def parse_args() -> Config:
     parser.add_argument("--generation-length-penalty", type=float, default=1.0)
     parser.add_argument("--decoder-concept-evidence-topk", type=int, default=12)
     parser.add_argument("--decoder-region-evidence-topk", type=int, default=8)
-    parser.add_argument("--progress-style", choices=["epoch", "batch", "none"], default="epoch")
+    parser.add_argument("--progress-style", choices=["epoch", "batch", "single", "none"], default="epoch")
+    parser.add_argument("--progress-update-every", type=int, default=10)
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
     cfg = Config(
@@ -129,6 +132,7 @@ def parse_args() -> Config:
         decoder_concept_evidence_topk=args.decoder_concept_evidence_topk,
         decoder_region_evidence_topk=args.decoder_region_evidence_topk,
         progress_style=args.progress_style,
+        progress_update_every=args.progress_update_every,
         device=args.device,
     )
     return cfg
@@ -227,6 +231,19 @@ def _progress_postfix(totals: dict[str, float], n: int) -> dict[str, str]:
     return {key.replace("_loss", ""): f"{totals[key] / max(1, n):.4f}" for key in keys if key in totals}
 
 
+def _single_line_progress(stage: str, epoch: int, cfg: Config, step: int, total: int, totals: dict[str, float], n: int, started: float) -> None:
+    width = 24
+    frac = step / max(1, total)
+    done = int(width * frac)
+    bar = "#" * done + "-" * (width - done)
+    elapsed = max(0.0, time.time() - started)
+    rate = step / elapsed if elapsed > 0 else 0.0
+    postfix = " ".join(f"{k}={v}" for k, v in _progress_postfix(totals, n).items())
+    text = f"\r{stage} {epoch}/{cfg.epochs} [{bar}] {step}/{total} {100 * frac:5.1f}% {rate:4.2f}it/s {postfix}"
+    sys.stdout.write(text[:220].ljust(220))
+    sys.stdout.flush()
+
+
 def _write_history_csv(history: list[dict[str, float]], out_dir: Path) -> None:
     if not history:
         return
@@ -284,8 +301,11 @@ def run_epoch(model, loader, optimizer, cfg: Config, device: torch.device, train
     n = 0
     stage = "train" if train else "valid"
     use_batch_bar = cfg.progress_style == "batch"
+    use_single_line = cfg.progress_style == "single"
     iterator = tqdm(loader, desc=f"{stage} {epoch}/{cfg.epochs}", leave=False, dynamic_ncols=True, smoothing=0.05) if use_batch_bar else loader
-    for batch in iterator:
+    total_batches = len(loader)
+    started = time.time()
+    for step, batch in enumerate(iterator, start=1):
         images = batch["image"].to(device)
         tokens = batch["tokens"].to(device)
         attention_mask = batch.get("attention_mask")
@@ -330,6 +350,11 @@ def run_epoch(model, loader, optimizer, cfg: Config, device: torch.device, train
             totals[key] = totals.get(key, 0.0) + val * bs
         if use_batch_bar:
             iterator.set_postfix(_progress_postfix(totals, n))
+        if use_single_line and (step == 1 or step == total_batches or step % max(1, cfg.progress_update_every) == 0):
+            _single_line_progress(stage, epoch, cfg, step, total_batches, totals, n, started)
+    if use_single_line:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
     return {k: v / max(1, n) for k, v in totals.items()}
 
 
@@ -490,6 +515,8 @@ def main() -> None:
     tqdm.write(f"Train batches: {len(train_loader):,} | valid batches: {len(valid_loader):,}")
     if cfg.progress_style == "batch":
         tqdm.write("Live progress: batch bars show rolling epoch averages. Artifacts update after each epoch.")
+    elif cfg.progress_style == "single":
+        tqdm.write("Live progress: one compact updating line per train/valid phase. Artifacts update after each epoch.")
     elif cfg.progress_style == "epoch":
         tqdm.write("Live progress: one epoch bar plus one summary per epoch. Artifacts update after each epoch.")
     else:
@@ -523,7 +550,7 @@ def main() -> None:
     best = float("inf")
     history = []
     epoch_iter = range(1, cfg.epochs + 1)
-    epoch_bar = tqdm(epoch_iter, desc="epochs", dynamic_ncols=True) if cfg.progress_style != "none" else epoch_iter
+    epoch_bar = tqdm(epoch_iter, desc="epochs", dynamic_ncols=True) if cfg.progress_style not in {"none", "single"} else epoch_iter
     for epoch in epoch_bar:
         train_metrics = run_epoch(model, train_loader, optimizer, cfg, device, train=True, epoch=epoch)
         valid_metrics = run_epoch(model, valid_loader, optimizer, cfg, device, train=False, epoch=epoch)
@@ -543,7 +570,7 @@ def main() -> None:
             best = valid_metrics["loss"]
             torch.save({"model": model.state_dict(), "config": cfg.to_dict()}, out_dir / "best_model.pt")
             tqdm.write(f"New best validation loss: {best:.4f}; checkpoint saved.")
-        if cfg.progress_style != "none":
+        if cfg.progress_style not in {"none", "single"}:
             epoch_bar.set_postfix(best=f"{best:.4f}", valid=f"{valid_metrics['loss']:.4f}")
     print(f"Best validation loss: {best:.4f}")
     print(f"Saved checkpoint to {Path(out_dir) / 'best_model.pt'}")

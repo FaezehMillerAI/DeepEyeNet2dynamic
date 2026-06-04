@@ -57,6 +57,7 @@ class Config:
     decoder_concept_evidence_topk: int = 12
     decoder_region_evidence_topk: int = 8
     progress_style: str = "epoch"
+    progress_update_every: int = 10
     dropout: float = 0.2
     batch_size: int = 8
     epochs: int = 15
