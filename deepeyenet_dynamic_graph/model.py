@@ -777,7 +777,7 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         rc_edges = []
         token_concept_edges = []
-        graph_queries = self.llm_state_to_graph(llm_hidden)
+        graph_queries = self.llm_state_to_graph(llm_hidden.to(self.llm_state_to_graph.weight.dtype))
         for t in range(graph_queries.shape[1]):
             query = graph_queries[:, t]
             rc_edges.append(self.compute_region_concept_edges_from_query(region_features, concept_features, query))
@@ -1216,7 +1216,7 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         rc_edges = []
         token_concept_edges = []
-        graph_queries = self.llm_state_to_graph(decoder_hidden)
+        graph_queries = self.llm_state_to_graph(decoder_hidden.to(self.llm_state_to_graph.weight.dtype))
         for t in range(graph_queries.shape[1]):
             query = graph_queries[:, t]
             rc_edges.append(self.compute_region_concept_edges_from_query(region_features, concept_features, query))
