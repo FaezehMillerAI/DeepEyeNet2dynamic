@@ -573,8 +573,11 @@ def compute_losses(
     else:
         lm_targets = target_tokens[:, 1 : output.logits.shape[1] + 1]
         rep_loss = F.cross_entropy(output.logits.reshape(-1, output.logits.shape[-1]), lm_targets.reshape(-1), ignore_index=pad_id)
+    concept_targets = concept_targets.to(output.concept_logits.device, output.concept_logits.dtype).clamp(0.0, 1.0)
     concept_loss = F.binary_cross_entropy_with_logits(output.concept_logits, concept_targets)
-    graph_readout = output.token_concept_edges.max(dim=1).values.clamp(1e-4, 1 - 1e-4)
+    graph_readout = output.token_concept_edges.max(dim=1).values
+    graph_readout = torch.nan_to_num(graph_readout, nan=1e-4, posinf=1.0 - 1e-4, neginf=1e-4)
+    graph_readout = graph_readout.to(concept_targets.dtype).clamp(1e-4, 1.0 - 1e-4)
     align_loss = F.binary_cross_entropy(graph_readout, concept_targets)
     coverage_loss = torch.tensor(0.0, device=target_tokens.device)
     if coverage_token_ids is not None and coverage_token_ids.numel() and output.logits.numel():
@@ -591,7 +594,7 @@ def compute_losses(
             sample_losses.append(-best_log_probs.mean())
         if sample_losses:
             coverage_loss = torch.stack(sample_losses).mean()
-    edge_probs = output.token_concept_edges.clamp_min(1e-8)
+    edge_probs = torch.nan_to_num(output.token_concept_edges, nan=1e-8, posinf=1.0, neginf=1e-8).clamp(1e-8, 1.0)
     sparse_loss = -(edge_probs * edge_probs.log()).sum(dim=-1).mean()
     temp_loss = torch.tensor(0.0, device=target_tokens.device)
     if output.rc_edges.shape[1] > 2:
