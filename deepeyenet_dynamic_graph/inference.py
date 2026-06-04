@@ -113,6 +113,10 @@ def _build_hf_model(cfg: Config, tokenizer, concepts: list[str], concept_graph: 
         cfg.freeze_llm,
         cfg.prefix_length,
         cfg.concept_logit_bias,
+        cfg.llm_trust_remote_code,
+        cfg.llm_dtype,
+        cfg.llm_attn_implementation,
+        cfg.decoder_prompt,
     )
 
 
@@ -148,7 +152,7 @@ def main() -> None:
         from transformers import AutoTokenizer
 
         tokenizer_source = run_dir if (run_dir / "tokenizer_config.json").exists() else cfg.llm_name
-        tokenizer = _prepare_tokenizer(AutoTokenizer.from_pretrained(tokenizer_source))
+        tokenizer = _prepare_tokenizer(AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=bool(cfg.llm_trust_remote_code)))
         model = _build_hf_model(cfg, tokenizer, concepts, concept_graph).to(device)
         decoder = tokenizer
     else:

@@ -127,6 +127,10 @@ def _build_hf_model(cfg: Config, tokenizer, concepts: list[str], concept_graph: 
         cfg.freeze_llm,
         cfg.prefix_length,
         cfg.concept_logit_bias,
+        cfg.llm_trust_remote_code,
+        cfg.llm_dtype,
+        cfg.llm_attn_implementation,
+        cfg.decoder_prompt,
     )
 
 
@@ -464,7 +468,7 @@ def main() -> None:
         from transformers import AutoTokenizer
 
         tokenizer_source = run_dir if (run_dir / "tokenizer_config.json").exists() else cfg.llm_name
-        tokenizer = _prepare_tokenizer(AutoTokenizer.from_pretrained(tokenizer_source))
+        tokenizer = _prepare_tokenizer(AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=bool(cfg.llm_trust_remote_code)))
         dataset = HFMedicalReportDataset(cfg.data_root, args.split, tokenizer, concepts, cfg.dataset, cfg.image_size, cfg.max_report_len, cfg.seed)
         pad_id, _, _ = _token_ids(tokenizer)
         loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=functools.partial(collate_hf_fn, pad_id=pad_id))

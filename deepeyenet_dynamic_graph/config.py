@@ -35,7 +35,11 @@ class Config:
     hidden_dim: int = 256
     decoder_type: str = "llm"
     llm_name: str = "distilgpt2"
+    llm_trust_remote_code: bool = False
+    llm_dtype: str = "auto"
+    llm_attn_implementation: str | None = None
     freeze_llm: bool = False
+    decoder_prompt: str | None = None
     prefix_length: int = 4
     concept_logit_bias: float = 0.8
     graph_steps: int = 1

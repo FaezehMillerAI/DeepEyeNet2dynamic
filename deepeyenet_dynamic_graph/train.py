@@ -45,7 +45,11 @@ def parse_args() -> Config:
     parser.add_argument("--freeze-vision-encoder", action="store_true")
     parser.add_argument("--decoder-type", choices=["llm", "causal_lm", "seq2seq", "gru"], default="llm")
     parser.add_argument("--llm-name", default="distilgpt2")
+    parser.add_argument("--llm-trust-remote-code", action="store_true")
+    parser.add_argument("--llm-dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
+    parser.add_argument("--llm-attn-implementation", default=None)
     parser.add_argument("--freeze-llm", action="store_true")
+    parser.add_argument("--decoder-prompt", default=None)
     parser.add_argument("--prefix-length", type=int, default=4)
     parser.add_argument("--concept-logit-bias", type=float, default=0.8)
     parser.add_argument("--graph-steps", type=int, default=1)
@@ -97,7 +101,11 @@ def parse_args() -> Config:
         freeze_vision_encoder=args.freeze_vision_encoder,
         decoder_type=args.decoder_type,
         llm_name=args.llm_name,
+        llm_trust_remote_code=args.llm_trust_remote_code,
+        llm_dtype=args.llm_dtype,
+        llm_attn_implementation=args.llm_attn_implementation,
         freeze_llm=args.freeze_llm,
+        decoder_prompt=args.decoder_prompt,
         prefix_length=args.prefix_length,
         concept_logit_bias=args.concept_logit_bias,
         graph_steps=args.graph_steps,
@@ -147,6 +155,10 @@ def _prepare_tokenizer(tokenizer):
     if tokenizer.eos_token is None and tokenizer.pad_token is not None:
         tokenizer.eos_token = tokenizer.pad_token
     return tokenizer
+
+
+def _tokenizer_kwargs(cfg: Config) -> dict:
+    return {"trust_remote_code": bool(cfg.llm_trust_remote_code)}
 
 
 def _token_ids(tokenizer) -> tuple[int, int, int]:
@@ -203,6 +215,10 @@ def _build_hf_model(cfg: Config, tokenizer, concepts: list[str], concept_graph: 
         cfg.freeze_llm,
         cfg.prefix_length,
         cfg.concept_logit_bias,
+        cfg.llm_trust_remote_code,
+        cfg.llm_dtype,
+        cfg.llm_attn_implementation,
+        cfg.decoder_prompt,
     )
 
 
@@ -329,7 +345,7 @@ def main() -> None:
     if _uses_hf_decoder(cfg):
         from transformers import AutoTokenizer
 
-        tokenizer = _prepare_tokenizer(AutoTokenizer.from_pretrained(cfg.llm_name))
+        tokenizer = _prepare_tokenizer(AutoTokenizer.from_pretrained(cfg.llm_name, **_tokenizer_kwargs(cfg)))
         tokenizer.save_pretrained(out_dir)
         tqdm.write("Loading training metadata and image paths...")
         train_records = load_split_records(cfg.data_root, "train", dataset=cfg.dataset, seed=cfg.seed)

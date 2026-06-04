@@ -29,6 +29,32 @@ def _hf_hidden_size(config) -> int:
     raise ValueError(f"Could not infer HuggingFace hidden size from {config.__class__.__name__}")
 
 
+def _hf_decoder_load_kwargs(
+    trust_remote_code: bool = False,
+    torch_dtype: str = "auto",
+    attn_implementation: str | None = None,
+) -> dict:
+    kwargs: dict = {"trust_remote_code": bool(trust_remote_code)}
+    dtype_map = {
+        "auto": "auto",
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    if torch_dtype:
+        kwargs["torch_dtype"] = dtype_map.get(str(torch_dtype).lower(), torch_dtype)
+    if attn_implementation:
+        kwargs["attn_implementation"] = attn_implementation
+    return kwargs
+
+
+def _default_report_prompt() -> str:
+    return (
+        "Generate a concise medical imaging report with Findings and Impression. "
+        "Use the provided visual-clinical graph evidence and avoid unsupported findings."
+    )
+
+
 CONCEPT_DECODER_ALIASES = {
     "effusion": ["effusion", "pleural effusion"],
     "pneumothorax": ["pneumothorax"],
@@ -610,6 +636,10 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         freeze_llm: bool = False,
         prefix_length: int = 4,
         concept_logit_bias: float = 0.8,
+        llm_trust_remote_code: bool = False,
+        llm_dtype: str = "auto",
+        llm_attn_implementation: str | None = None,
+        decoder_prompt: str | None = None,
     ) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -636,10 +666,19 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
             freeze_vision_encoder=freeze_vision_encoder,
         )
         self.llm_name = llm_name
-        self.llm = AutoModelForCausalLM.from_pretrained(llm_name)
+        self.llm = AutoModelForCausalLM.from_pretrained(
+            llm_name,
+            **_hf_decoder_load_kwargs(llm_trust_remote_code, llm_dtype, llm_attn_implementation),
+        )
         self.llm_dim = _hf_hidden_size(self.llm.config)
         self.concept_logit_bias = float(concept_logit_bias)
-        tokenizer = AutoTokenizer.from_pretrained(llm_name)
+        tokenizer = AutoTokenizer.from_pretrained(llm_name, trust_remote_code=bool(llm_trust_remote_code))
+        prompt_ids = tokenizer(
+            decoder_prompt or _default_report_prompt(),
+            add_special_tokens=False,
+            return_tensors="pt",
+        ).input_ids[0]
+        self.register_buffer("decoder_prompt_ids", prompt_ids.long(), persistent=False)
         self.register_buffer(
             "concept_token_mask",
             _build_concept_token_mask(tokenizer, concept_names, int(self.llm.config.vocab_size)),
@@ -707,6 +746,12 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         prefix = self.prefix_proj(base).unsqueeze(1).expand(batch, self.prefix_length, self.llm_dim)
         return prefix + self.prefix_offset.unsqueeze(0)
 
+    def _prompt_embeds(self, batch: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        prompt_ids = self.decoder_prompt_ids.to(device).unsqueeze(0).expand(batch, -1)
+        prompt_embeds = self.llm.get_input_embeddings()(prompt_ids)
+        prompt_mask = torch.ones(prompt_ids.shape, dtype=torch.long, device=device)
+        return prompt_embeds, prompt_mask
+
     def _graph_forward(
         self,
         images: torch.Tensor,
@@ -754,19 +799,22 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
             images, suppress_anatomy_ids, suppress_concept_ids
         )
         text_embeds = self.llm.get_input_embeddings()(tokens)
-        inputs_embeds = torch.cat([prefix, text_embeds], dim=1)
+        prompt_embeds, prompt_mask = self._prompt_embeds(tokens.shape[0], tokens.device)
+        inputs_embeds = torch.cat([prefix, prompt_embeds, text_embeds], dim=1)
         if attention_mask is None:
             attention_mask = (tokens != self.pad_id).long()
         prefix_mask = torch.ones(tokens.shape[0], self.prefix_length, dtype=attention_mask.dtype, device=tokens.device)
-        full_mask = torch.cat([prefix_mask, attention_mask], dim=1)
+        full_mask = torch.cat([prefix_mask, prompt_mask.to(attention_mask.dtype), attention_mask], dim=1)
         labels = tokens.clone()
         labels[attention_mask == 0] = -100
         prefix_labels = torch.full((tokens.shape[0], self.prefix_length), -100, dtype=torch.long, device=tokens.device)
-        labels = torch.cat([prefix_labels, labels], dim=1)
+        prompt_labels = torch.full(prompt_mask.shape, -100, dtype=torch.long, device=tokens.device)
+        labels = torch.cat([prefix_labels, prompt_labels, labels], dim=1)
         lm_out = self.llm(inputs_embeds=inputs_embeds, attention_mask=full_mask, labels=labels, output_hidden_states=True, return_dict=True)
         concept_logits = self.concept_head(concept_features).squeeze(-1)
         steps = max(1, tokens.shape[1] - 1)
-        token_hidden = lm_out.hidden_states[-1][:, self.prefix_length : self.prefix_length + steps]
+        text_start = self.prefix_length + prompt_embeds.shape[1]
+        token_hidden = lm_out.hidden_states[-1][:, text_start : text_start + steps]
         rc_seq, token_concept = self._dynamic_edges_from_llm_hidden(token_hidden, region_features, concept_features)
         logits = lm_out.logits[:, self.prefix_length :, :]
         logits = self._apply_concept_logit_bias(logits, token_concept, concept_logits)
@@ -785,7 +833,8 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         finished = torch.zeros(batch, dtype=torch.bool, device=images.device)
         for _ in range(max_len - 1):
             text_embeds = self.llm.get_input_embeddings()(generated)
-            inputs_embeds = torch.cat([prefix, text_embeds], dim=1)
+            prompt_embeds, _ = self._prompt_embeds(batch, images.device)
+            inputs_embeds = torch.cat([prefix, prompt_embeds, text_embeds], dim=1)
             mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=images.device)
             out = self.llm(inputs_embeds=inputs_embeds, attention_mask=mask, output_hidden_states=True, return_dict=True)
             next_logits = out.logits[:, -1, :]
@@ -808,10 +857,11 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
             token_concept = torch.stack(token_concept_edges, dim=1)
         elif gen_tokens.shape[1] > 0:
             text_embeds = self.llm.get_input_embeddings()(generated[:, :-1])
-            inputs_embeds = torch.cat([prefix, text_embeds], dim=1)
+            prompt_embeds, _ = self._prompt_embeds(batch, images.device)
+            inputs_embeds = torch.cat([prefix, prompt_embeds, text_embeds], dim=1)
             mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=images.device)
             hidden_out = self.llm(inputs_embeds=inputs_embeds, attention_mask=mask, output_hidden_states=True, return_dict=True)
-            token_hidden = hidden_out.hidden_states[-1][:, self.prefix_length :]
+            token_hidden = hidden_out.hidden_states[-1][:, self.prefix_length + prompt_embeds.shape[1] :]
             rc_seq, token_concept = self._dynamic_edges_from_llm_hidden(token_hidden, region_features, concept_features)
         else:
             rc_seq = torch.empty(batch, 0, region_features.shape[1], self.num_concepts, device=images.device)
@@ -852,6 +902,10 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         freeze_llm: bool = False,
         prefix_length: int = 4,
         concept_logit_bias: float = 0.8,
+        llm_trust_remote_code: bool = False,
+        llm_dtype: str = "auto",
+        llm_attn_implementation: str | None = None,
+        decoder_prompt: str | None = None,
     ) -> None:
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
@@ -879,14 +933,14 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
             freeze_vision_encoder=freeze_vision_encoder,
         )
         self.llm_name = llm_name
-        self.llm = AutoModelForSeq2SeqLM.from_pretrained(llm_name)
+        self.llm = AutoModelForSeq2SeqLM.from_pretrained(
+            llm_name,
+            **_hf_decoder_load_kwargs(llm_trust_remote_code, llm_dtype, llm_attn_implementation),
+        )
         self.llm_dim = _hf_hidden_size(self.llm.config)
         self.concept_logit_bias = float(concept_logit_bias)
-        tokenizer = AutoTokenizer.from_pretrained(llm_name)
-        self.encoder_prompt = (
-            "Generate a chest x-ray radiology report. "
-            "Describe visible abnormal and normal findings, then write the impression."
-        )
+        tokenizer = AutoTokenizer.from_pretrained(llm_name, trust_remote_code=bool(llm_trust_remote_code))
+        self.encoder_prompt = decoder_prompt or _default_report_prompt()
         prompt_ids = tokenizer(
             self.encoder_prompt,
             add_special_tokens=True,
