@@ -707,8 +707,8 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
         steps = min(logits.shape[1], token_concept_edges.shape[1])
         if steps <= 0:
             return logits
-        concept_conf = torch.sigmoid(concept_logits).unsqueeze(1)
-        active_concepts = token_concept_edges[:, :steps] * concept_conf
+        concept_conf = torch.sigmoid(concept_logits).to(logits.dtype).unsqueeze(1)
+        active_concepts = token_concept_edges[:, :steps].to(logits.dtype) * concept_conf
         vocab_bias = torch.matmul(active_concepts, self.concept_token_mask.to(logits.device, logits.dtype))
         biased = logits.clone()
         biased[:, :steps] = biased[:, :steps] + self.concept_logit_bias * vocab_bias
@@ -722,8 +722,8 @@ class GraphPrefixLLMCaptioner(DynamicGraphCaptioner):
     ) -> torch.Tensor:
         if self.concept_logit_bias <= 0 or self.concept_token_mask.numel() == 0:
             return next_logits
-        concept_conf = torch.sigmoid(concept_logits)
-        active_concepts = token_concept * concept_conf
+        concept_conf = torch.sigmoid(concept_logits).to(next_logits.dtype)
+        active_concepts = token_concept.to(next_logits.dtype) * concept_conf
         vocab_bias = torch.matmul(active_concepts, self.concept_token_mask.to(next_logits.device, next_logits.dtype))
         return next_logits + self.concept_logit_bias * vocab_bias
 
@@ -1019,8 +1019,8 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
         steps = min(logits.shape[1], token_concept_edges.shape[1])
         if steps <= 0:
             return logits
-        concept_conf = torch.sigmoid(concept_logits).unsqueeze(1)
-        active_concepts = token_concept_edges[:, :steps] * concept_conf
+        concept_conf = torch.sigmoid(concept_logits).to(logits.dtype).unsqueeze(1)
+        active_concepts = token_concept_edges[:, :steps].to(logits.dtype) * concept_conf
         vocab_bias = torch.matmul(active_concepts, self.concept_token_mask.to(logits.device, logits.dtype))
         biased = logits.clone()
         biased[:, :steps] = biased[:, :steps] + self.concept_logit_bias * vocab_bias
@@ -1034,8 +1034,8 @@ class GraphSeq2SeqCaptioner(DynamicGraphCaptioner):
     ) -> torch.Tensor:
         if self.concept_logit_bias <= 0 or self.concept_token_mask.numel() == 0:
             return next_logits
-        concept_conf = torch.sigmoid(concept_logits)
-        active_concepts = token_concept * concept_conf
+        concept_conf = torch.sigmoid(concept_logits).to(next_logits.dtype)
+        active_concepts = token_concept.to(next_logits.dtype) * concept_conf
         vocab_bias = torch.matmul(active_concepts, self.concept_token_mask.to(next_logits.device, next_logits.dtype))
         return next_logits + self.concept_logit_bias * vocab_bias
 
